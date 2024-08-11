@@ -1,0 +1,15 @@
+# source
+**/*.ts
+*.ts
+
+# definitions
+!**/*.d.ts
+!*.d.ts
+
+node_modules
+.eslintrc.js
+.gitignore
+.prettierrc
+tsconfig.json
+tsconfig.tsbuildinfo
+yarn.lock

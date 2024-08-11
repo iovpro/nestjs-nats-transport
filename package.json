@@ -1,0 +1,48 @@
+{
+  "name": "nestjs-nats-transport",
+  "version": "1.0.0",
+  "description": "Nats Transport for NestJS with JetStream support",
+  "author": "Iaroslav Vorobev",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "keywords": [
+    "nestjs",
+    "nats",
+    "jetstream",
+    "transport",
+    "microservices"
+  ],
+  "engines": {
+    "node": ">= 16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iovpro/nestjs-nats-transport.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iovpro/nestjs-nats-transport/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "rimraf dist && rimraf tsconfig.tsbuildinfo && tsc",
+    "build2": "tsc -b -v packages",
+    "format": "prettier \"**/*.ts\" \"packages/**/*.json\" --ignore-path ./.prettierignore --write && git status",
+    "lint": "eslint 'src/**/**.ts' --ignore-pattern 'src/**/*.spec.ts' --fix"
+  },
+  "dependencies": {
+    "@nestjs/common": "10.3.9",
+    "@nestjs/core": "10.3.9",
+    "@nestjs/microservices": "^10.3.9",
+    "nats": "^2.26.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.4",
+    "rimraf": "^5.0.7",
+    "typescript": "^5.4.5"
+  }
+}
