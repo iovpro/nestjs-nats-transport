@@ -4,8 +4,8 @@ import { HttpStatus } from '@nestjs/common';
  * @publicApi
  */
 export interface NatsRpcExceptionInterface {
-  code?: string;
   message: string;
+  errorCode?: string;
   statusCode?: HttpStatus;
   errors?: any;
 }

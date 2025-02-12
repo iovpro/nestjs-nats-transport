@@ -1,2 +1,2 @@
-export * from './nats-json-client.deserializer';
-export * from './nats-json-server.deserializer';
+export * from './nats-response-json.deserializer';
+export * from './nats-request-json.deserializer';

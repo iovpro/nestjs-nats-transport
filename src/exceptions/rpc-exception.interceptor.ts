@@ -1,11 +1,4 @@
-import {
-  Injectable,
-  NestInterceptor,
-  ExecutionContext,
-  CallHandler,
-  Logger,
-  HttpStatus,
-} from '@nestjs/common';
+import { Injectable, NestInterceptor, ExecutionContext, CallHandler, Logger, HttpStatus } from '@nestjs/common';
 import { Observable, throwError } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 import { RpcException } from '@nestjs/microservices';
@@ -29,19 +22,13 @@ export class NatsRpcExceptionInterceptor implements NestInterceptor {
   logException(context: ExecutionContext, err: any) {
     const controller = context.getClass();
     const handler = context.getHandler();
-    const logger = new Logger(
-      controller?.name
-        ? controller?.name + '.' + handler?.name
-        : 'NatsRpcExceptionsHandler',
-    );
+    const logger = new Logger(controller?.name ? controller?.name + '.' + handler?.name : 'NatsRpcExceptionsHandler');
 
-    const statusCode: HttpStatus =
-      (err.error || err.err || err)?.statusCode ||
-      (err.error || err.err || err)?.status;
+    const statusCode: HttpStatus = err?.statusCode || err?.status;
 
-    if (!statusCode || statusCode >= 500) {
+    if (!statusCode || (statusCode >= 500 && statusCode < 600)) {
       logger.error(err);
-    } else if (statusCode < 500) {
+    } else {
       logger.debug(err);
     }
   }

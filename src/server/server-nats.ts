@@ -22,66 +22,59 @@ import {
   DeliverPolicy,
   ReplayPolicy,
   ConnectionOptions,
-  createInbox,
   ConsumerUpdateConfig,
+  headers as natsMsgHeaders,
+  Consumer,
 } from 'nats';
+import { SimpleMutex } from 'nats/lib/nats-base-client/util';
 import { NatsContext } from '../ctx-host/nats.context';
-import { NatsJSONSerializer } from '../serializers/nats-json.serializer';
-import { NatsJSONServerDeserializer } from '../deserializers/nats-json-server.deserializer';
-import { createHash } from 'crypto';
-import { NatsServerConnectionOptions } from '../interfaces/nats-server-configuration.interface';
-import {
-  NakStrategy,
-  NatsEventOptions,
-} from '../interfaces/nats-event-options.interface';
-import {
-  DEFAULT_MAX_NAK_DELAY,
-  DEFAULT_NAK_DELAY,
-  NAK,
-  TERM,
-} from '../constants';
+import { NatsResponseSerializer } from '../serializers';
+import { NatsRequestJSONDeserializer } from '../deserializers';
+import { NatsServerConnectionOptions, NakStrategy, NatsEventHandlerOptions } from '../interfaces';
+import { DEFAULT_MAX_NAK_DELAY, DEFAULT_NAK_DELAY, NAK, TERM } from '../constants';
 
 /**
  * @publicApi
  */
-export class ServerNats
-  extends Server
-  implements CustomTransportStrategy, OnModuleDestroy
-{
+export class ServerNats extends Server implements CustomTransportStrategy, OnModuleDestroy {
   public readonly transportId = Transport.NATS;
+  protected readonly logger: Logger;
 
   private natsClient: NatsConnection;
   private jetstreamClient: JetStreamClient;
   private jetstreamManager: JetStreamManager;
-
-  protected readonly logger: Logger = new Logger(ServerNats.name);
 
   constructor(
     private readonly options: NatsServerConnectionOptions,
     private readonly streams?: Partial<StreamConfig>[],
   ) {
     super();
+    this.logger = new Logger(ServerNats.name);
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public async listen(
-    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
-  ) {
+  public async onModuleDestroy() {
+    await this.close();
+  }
+
+  public async listen(callback: (err?: unknown, ...optionalParams: unknown[]) => void) {
     try {
       this.natsClient = await this.createClient();
-      if (this.options.useJetStream) {
-        this.jetstreamClient = this.natsClient.jetstream();
-        this.jetstreamManager = await this.natsClient.jetstreamManager(
-          this.options.jetStreamOptions,
-        );
+      if (this.options.jetStream) {
+        this.jetstreamClient = this.createJetStreamClient();
+        this.jetstreamManager = await this.createJetStreamManager();
         if (this.streams) {
           await this.setupStreams();
         }
       }
       this.handleStatusUpdates(this.natsClient);
       await this.start(callback);
+
+      this.logger.log(
+        `Nats server connected to "${this.natsClient.getServer()}" server id "${this.natsClient.info.server_id}"`,
+      );
     } catch (err) {
       callback(err);
     }
@@ -95,68 +88,34 @@ export class ServerNats
     });
   }
 
-  public async start(
-    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
-  ) {
-    if (this.options.useJetStream) {
-      await this.bindJetStreamEvents();
-    } else {
-      this.bindEvents();
-    }
-    this.bindRequests();
-    callback();
+  private createJetStreamClient(): JetStreamClient {
+    return this.natsClient.jetstream();
   }
 
-  public async bindJetStreamEvents() {
-    const eventHandlers = [...this.messageHandlers.entries()].filter(
-      ([, handler]) => handler.isEventHandler,
-    );
+  private async createJetStreamManager(): Promise<JetStreamManager> {
+    return await this.natsClient.jetstreamManager(this.options.jetStreamOptions);
+  }
 
-    const subscribe = async (
-      channel: string,
-      handler: MessageHandler<any, any, any>,
-    ) => {
-      const consumerName = this.buildConsumerName(channel);
-      const eventOptions: NatsEventOptions = handler.extras || {};
+  public async close() {
+    await this.natsClient?.close();
+    this.natsClient = null;
+    this.jetstreamClient = null;
+    this.jetstreamManager = null;
+    this.logger.log('Nats server disconnected');
+  }
 
-      const consumerOptions = this.buildConsumerOptions(eventOptions);
-
-      const stream = await this.getStream(channel);
-      let consumer = await this.getConsumer(stream, consumerName);
-
-      if (consumer) {
-        await this.jetstreamManager.consumers.update(
-          stream,
-          consumerName,
-          consumerOptions,
-        );
+  public async start(callback: (err?: unknown, ...optionalParams: unknown[]) => void) {
+    try {
+      if (this.options.jetStream) {
+        await this.bindJetStreamEvents();
       } else {
-        await this.jetstreamManager.consumers.add(stream, {
-          name: consumerName,
-          durable_name: consumerName,
-          deliver_group: this.options.consumerName,
-          filter_subject: channel,
-          ack_policy: AckPolicy.Explicit,
-          deliver_policy: DeliverPolicy.New,
-          replay_policy: ReplayPolicy.Instant,
-          ...consumerOptions,
-        });
-        consumer = await this.getConsumer(stream, consumerName);
+        this.bindEvents();
       }
-
-      consumer.consume({
-        callback: this.getJetStreamEventHandler(channel, handler).bind(this),
-        ...(eventOptions.max_messages
-          ? { max_messages: eventOptions.max_messages }
-          : {}),
-      });
-
-      this.logger.log(`Subscribed to [${channel}] events`);
-    };
-
-    eventHandlers.forEach(
-      async ([channel, handler]) => await subscribe(channel, handler),
-    );
+      this.bindRequests();
+      callback();
+    } catch (err) {
+      callback(err);
+    }
   }
 
   private async getStream(channel: string) {
@@ -217,21 +176,13 @@ export class ServerNats
   }
 
   private buildConsumerName(channel: string) {
-    return [
-      this.options.consumerName,
-      createHash('sha256').update(channel).digest('hex'),
-    ].join('-');
+    return [this.options.consumerName, channel.replace(/\s|\.|>|\*/g, '-')].join(':');
   }
 
   public bindEvents() {
-    const eventHandlers = [...this.messageHandlers.entries()].filter(
-      ([, handler]) => handler.isEventHandler,
-    );
+    const eventHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => handler.isEventHandler);
 
-    const subscribe = (
-      channel: string,
-      handler: MessageHandler<any, any, any>,
-    ) => {
+    const subscribe = (channel: string, handler: MessageHandler<any, any, any>) => {
       this.natsClient.subscribe(channel, {
         queue: this.options.consumerName,
         callback: this.getEventHandler(channel, handler).bind(this),
@@ -244,14 +195,9 @@ export class ServerNats
   }
 
   public bindRequests() {
-    const requestHandlers = [...this.messageHandlers.entries()].filter(
-      ([, handler]) => !handler.isEventHandler,
-    );
+    const requestHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => !handler.isEventHandler);
 
-    const subscribe = (
-      channel: string,
-      handler: MessageHandler<any, any, any>,
-    ) => {
+    const subscribe = (channel: string, handler: MessageHandler<any, any, any>) => {
       this.natsClient.subscribe(channel, {
         queue: channel,
         callback: this.getRequestHandler(channel, handler).bind(this),
@@ -260,25 +206,101 @@ export class ServerNats
       this.logger.log(`Subscribed to [${channel}] requests`);
     };
 
-    requestHandlers.forEach(([channel, handler]) =>
-      subscribe(channel, handler),
-    );
+    requestHandlers.forEach(([channel, handler]) => subscribe(channel, handler));
   }
 
-  public async close() {
-    await this.natsClient?.close();
-    this.natsClient = null;
-    this.jetstreamClient = null;
+  public async bindJetStreamEvents() {
+    const eventHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => handler.isEventHandler);
+
+    const subscribe = async (channel: string, handler: MessageHandler<any, any, any>) => {
+      const consumerName = this.buildConsumerName(channel);
+      const eventOptions: NatsEventHandlerOptions = handler.extras || {};
+      const deliver_policy = eventOptions.deliver_policy || DeliverPolicy.New;
+
+      const consumerOptions = this.buildConsumerOptions(eventOptions);
+
+      const stream = await this.getStream(channel);
+      let consumer = await this.getConsumer(stream, consumerName);
+
+      if (consumer) {
+        await this.jetstreamManager.consumers.update(stream, consumerName, consumerOptions);
+      } else {
+        await this.jetstreamManager.consumers.add(stream, {
+          name: consumerName,
+          durable_name: consumerName,
+          deliver_group: this.options.consumerName,
+          filter_subject: channel,
+          ack_policy: AckPolicy.Explicit,
+          deliver_policy,
+          replay_policy: ReplayPolicy.Instant,
+          ...consumerOptions,
+        });
+        consumer = await this.getConsumer(stream, consumerName);
+      }
+
+      if (eventOptions.batch) {
+        const mutex = new SimpleMutex(eventOptions.max_handlers || 1);
+        void this.runBatchSubscription(consumer, channel, handler, eventOptions, mutex);
+        this.logger.log(`Subscribed to [${channel}] JetStream events batch`);
+      } else {
+        void this.runSubscription(consumer, channel, handler, eventOptions);
+        this.logger.log(`Subscribed to [${channel}] JetStream events`);
+      }
+    };
+
+    eventHandlers.forEach(async ([channel, handler]) => await subscribe(channel, handler));
   }
 
-  public async onModuleDestroy() {
-    await this.close();
-  }
-
-  public getEventHandler(
+  private async runSubscription(
+    consumer: Consumer,
     channel: string,
     handler: MessageHandler<any, any, any>,
-  ): Function {
+    eventOptions: NatsEventHandlerOptions,
+  ) {
+    try {
+      const iter = await consumer.consume(eventOptions.max_messages ? { max_messages: eventOptions.max_messages } : {});
+      const mutex = new SimpleMutex(eventOptions.max_handlers || 1);
+
+      for await (const message of iter) {
+        await mutex.lock();
+        void this.handleNatsJetStreamEvent(channel, message, handler, mutex);
+      }
+    } catch (err) {
+      this.logger.error(err, `Consumer [${channel}] failed`);
+    } finally {
+      if (this.jetstreamClient) void this.runSubscription(consumer, channel, handler, eventOptions);
+    }
+  }
+
+  private async runBatchSubscription(
+    consumer: Consumer,
+    channel: string,
+    handler: MessageHandler<any, any, any>,
+    eventOptions: NatsEventHandlerOptions,
+    mutex: SimpleMutex,
+  ) {
+    try {
+      await mutex.lock();
+      const expires = eventOptions.batch_expires || 1000;
+      const iter = await consumer.fetch({
+        expires,
+        ...(eventOptions.max_messages ? { max_messages: eventOptions.max_messages } : {}),
+      });
+
+      const batch: any[] = [];
+      for await (const message of iter) {
+        batch.push(message);
+      }
+      void this.handleNatsJetStreamBatchEvents(channel, batch, handler, mutex);
+    } catch (err) {
+      this.logger.error(err, `Batch consumer [${channel}] failed`);
+      mutex.unlock();
+    } finally {
+      if (this.jetstreamClient) void this.runBatchSubscription(consumer, channel, handler, eventOptions, mutex);
+    }
+  }
+
+  private getEventHandler(channel: string, handler: MessageHandler<any, any, any>): Function {
     return async (error: object | undefined, message: Msg) => {
       if (error) {
         return this.logger.error(error);
@@ -287,19 +309,13 @@ export class ServerNats
     };
   }
 
-  public getJetStreamEventHandler(
-    channel: string,
-    handler: MessageHandler<any, any, any>,
-  ): Function {
-    return async (message: JsMsg) => {
-      return this.handleNatsJetStreamEvent(channel, message, handler);
-    };
-  }
+  // private getJetStreamEventHandler(channel: string, handler: MessageHandler<any, any, any>): Function {
+  //   return async (message: JsMsg) => {
+  //     return this.handleNatsJetStreamEvent(channel, message, handler);
+  //   };
+  // }
 
-  public getRequestHandler(
-    channel: string,
-    handler: MessageHandler<any, any, any>,
-  ): Function {
+  private getRequestHandler(channel: string, handler: MessageHandler<any, any, any>): Function {
     return async (error: object | undefined, message: Msg) => {
       if (error) {
         return this.logger.error(error);
@@ -308,119 +324,164 @@ export class ServerNats
     };
   }
 
-  public async handleNatsEvent(
-    channel: string,
-    natsMsg: Msg,
-    handler: MessageHandler<any, any, any>,
-  ) {
-    const callerSubject = natsMsg.subject;
-    const rawMessage = natsMsg.data;
-    const replyTo = natsMsg.reply;
+  public async handleNatsEvent(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
+    try {
+      const natsCtx = new NatsContext([natsMsg.subject, natsMsg.headers]);
+      const message = await this.deserializer.deserialize(natsMsg.data, {
+        channel,
+        replyTo: natsMsg.reply,
+        headers: natsMsg.headers,
+      });
 
-    const natsCtx = new NatsContext([callerSubject, natsMsg.headers]);
-    const message = await this.deserializer.deserialize(rawMessage, {
-      channel,
-      replyTo,
-      headers: natsMsg.headers,
-    });
+      const response$ = this.transformToObservable(await handler(message.data || message, natsCtx));
 
-    const response$ = this.transformToObservable(
-      await handler(message.data, natsCtx),
-    );
+      const respond = async (response: WritePacket<any>) => {
+        return;
+      };
 
-    const respond = async (response: WritePacket<any>) => {
-      return;
-    };
-
-    this.send(response$, respond);
+      this.send(response$, respond);
+    } catch (err) {
+      this.logger.error(err, 'Incorrect event data');
+    }
   }
 
   public async handleNatsJetStreamEvent(
     channel: string,
     natsMsg: JsMsg,
     handler: MessageHandler<any, any, any>,
+    mutex: SimpleMutex,
   ) {
+    const eventOptions: NatsEventHandlerOptions = handler.extras || {};
     try {
       natsMsg.working();
 
-      const eventOptions: NatsEventOptions = handler.extras || {};
-
-      const callerSubject = natsMsg.subject;
-      const rawMessage = natsMsg.data;
-
-      const natsCtx = new NatsContext([callerSubject, natsMsg.headers]);
-      const message = await this.deserializer.deserialize(rawMessage, {
+      const natsCtx = new NatsContext([natsMsg.subject, natsMsg.headers]);
+      const message = await this.deserializer.deserialize(natsMsg.data, {
         channel,
         headers: natsMsg.headers,
       });
 
-      const response$ = this.transformToObservable(
-        await handler(message.data, natsCtx),
-      );
+      const response$ = this.transformToObservable(await handler(message.data || message, natsCtx));
 
       const respond = async (response: WritePacket<any>) => {
-        const nak = () =>
-          natsMsg.nak(this.calculateNakDelay(natsMsg, eventOptions));
-
-        if (response.err) return nak();
-        if (response.response === NAK) return nak();
-        if (response.response === TERM) return natsMsg.term();
-
-        return natsMsg.ack();
+        try {
+          if (response.err || response.response === NAK) {
+            natsMsg.nak(this.calculateNakDelay(natsMsg, eventOptions));
+          } else if (response.response === TERM) {
+            natsMsg.term();
+          } else {
+            natsMsg.ack();
+          }
+        } catch (e) {
+          this.logger.error(e);
+        } finally {
+          mutex.unlock();
+        }
       };
 
       this.send(response$, respond);
     } catch (err) {
       this.logger.error(err, 'Incorrect event data');
       natsMsg.term('Incorrect event data');
+      mutex.unlock();
     }
   }
 
-  private calculateNakDelay(
-    natsMsg: JsMsg,
-    { nak_strategy, nak_delay, nak_delay_max }: NatsEventOptions,
-  ) {
-    const strategy: NakStrategy = nak_strategy || NakStrategy.regular;
-
-    if (strategy == NakStrategy.regular) {
-      return nak_delay || DEFAULT_NAK_DELAY;
-    } else if (strategy == NakStrategy.increment) {
-      const delay =
-        natsMsg.info.redeliveryCount * (nak_delay || DEFAULT_NAK_DELAY);
-
-      if (delay > nak_delay_max || DEFAULT_MAX_NAK_DELAY) {
-        return nak_delay_max || DEFAULT_MAX_NAK_DELAY;
-      } else {
-        return delay;
-      }
-    }
-  }
-
-  public async handleRequest(
+  public async handleNatsJetStreamBatchEvents(
     channel: string,
-    natsMsg: Msg,
+    batchMsgs: JsMsg[],
     handler: MessageHandler<any, any, any>,
+    mutex: SimpleMutex,
   ) {
-    const callerSubject = natsMsg.subject;
-    const rawMessage = natsMsg.data;
+    const eventOptions: NatsEventHandlerOptions = handler.extras || {};
+    try {
+      const validNatsMsgs: JsMsg[] = [];
+      const messages: any[] = [];
+
+      await Promise.all(
+        batchMsgs.map(async natsMsg => {
+          natsMsg.working();
+          try {
+            const message = await this.deserializer.deserialize(natsMsg.data, {
+              channel,
+              headers: natsMsg.headers,
+            });
+            if (!message) throw new Error('Empty message');
+
+            validNatsMsgs.push(natsMsg);
+            messages.push(message.data || message);
+          } catch (e) {
+            natsMsg.term(e.message);
+          }
+        }),
+      );
+
+      if (!messages.length) {
+        mutex.unlock();
+        return;
+      }
+
+      const natsCtx = new NatsContext([validNatsMsgs[0].subject, natsMsgHeaders()]);
+      const response$ = this.transformToObservable(await handler(messages, natsCtx));
+
+      const respond = async (response: WritePacket<any>) => {
+        try {
+          if (response.err || response.response === NAK) {
+            batchMsgs.forEach(natsMsg => natsMsg.nak(this.calculateNakDelay(natsMsg, eventOptions)));
+          } else if (response.response === TERM) {
+            batchMsgs.forEach(natsMsg => natsMsg.term());
+          } else {
+            batchMsgs.forEach(natsMsg => natsMsg.ack());
+          }
+        } catch (e) {
+          this.logger.error(e);
+        } finally {
+          mutex.unlock();
+        }
+      };
+
+      this.send(response$, respond);
+    } catch (err) {
+      this.logger.error(err, 'Incorrect batch data');
+      try {
+        batchMsgs.forEach(async natsMsg => {
+          natsMsg.nak(this.calculateNakDelay(natsMsg, eventOptions));
+        });
+      } catch (e) {
+        this.logger.error(e);
+      }
+      mutex.unlock();
+    }
+  }
+
+  private calculateNakDelay(natsMsg: JsMsg, { nak_strategy, nak_delay, nak_delay_max }: NatsEventHandlerOptions) {
+    const strategy: NakStrategy = nak_strategy || NakStrategy.regular;
+    nak_delay = nak_delay || DEFAULT_NAK_DELAY;
+    nak_delay_max = nak_delay_max || DEFAULT_MAX_NAK_DELAY;
+
+    if (strategy === NakStrategy.regular) {
+      return nak_delay;
+    } else if (strategy === NakStrategy.increment) {
+      const delay = natsMsg.info.redeliveryCount * nak_delay;
+
+      if (delay > nak_delay_max) return nak_delay_max;
+      else return delay;
+    }
+  }
+
+  public async handleRequest(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
     const replyTo = natsMsg.reply;
 
-    const natsCtx = new NatsContext([callerSubject, natsMsg.headers]);
-    const incomingMessage: IncomingRequest =
-      (await this.deserializer.deserialize(rawMessage, {
-        channel,
-        replyTo,
-        headers: natsMsg.headers,
-      })) as IncomingRequest;
+    const natsCtx = new NatsContext([natsMsg.subject, natsMsg.headers]);
+    const incomingMessage: IncomingRequest = (await this.deserializer.deserialize(natsMsg.data, {
+      channel,
+      replyTo,
+      headers: natsMsg.headers,
+    })) as IncomingRequest;
 
-    const response$ = this.transformToObservable(
-      await handler(incomingMessage.data, natsCtx),
-    );
+    const response$ = this.transformToObservable(await handler(incomingMessage.data || incomingMessage, natsCtx));
     const respond = async (response: WritePacket<any>) => {
-      const message: NatsRecord = await this.serializer.serialize(
-        { id: incomingMessage.id, ...response },
-        {},
-      );
+      const message: NatsRecord = await this.serializer.serialize({ id: incomingMessage.id, ...response }, {});
       natsMsg.respond(message.data, {
         ...(message.headers ? { headers: message.headers } : {}),
       });
@@ -431,43 +492,33 @@ export class ServerNats
 
   public async handleStatusUpdates(client: NatsConnection) {
     for await (const status of client.status()) {
-      const data =
-        status.data && isObject(status.data)
-          ? JSON.stringify(status.data)
-          : status.data;
+      const data = status.data && isObject(status.data) ? JSON.stringify(status.data) : status.data;
 
       switch (status.type) {
         case 'error':
         case 'disconnect':
-          this.logger.error(
-            `NatsError: type: "${status.type}", data: "${data}".`,
-          );
+          this.logger.error(`NatsError: type: "${status.type}", data: "${data}".`);
           break;
 
         case 'pingTimer':
           if (this.options.connection.debug) {
-            this.logger.debug(
-              `NatsStatus: type: "${status.type}", data: "${data}".`,
-            );
+            this.logger.debug(`NatsStatus: type: "${status.type}", data: "${data}".`);
           }
           break;
 
         default:
-          this.logger.log(
-            `NatsStatus: type: "${status.type}", data: "${data}".`,
-          );
+          this.logger.log(`NatsStatus: type: "${status.type}", data: "${data}".`);
           break;
       }
     }
   }
 
   protected initializeSerializer(options: NatsServerConnectionOptions) {
-    this.serializer = options?.serializer ?? new NatsJSONSerializer();
+    this.serializer = options?.serializer ?? new NatsResponseSerializer();
   }
 
   protected initializeDeserializer(options: NatsServerConnectionOptions) {
-    this.deserializer =
-      options?.deserializer ?? new NatsJSONServerDeserializer();
+    this.deserializer = options?.deserializer ?? new NatsRequestJSONDeserializer();
   }
 
   protected async setupStreams(): Promise<void> {
@@ -475,9 +526,7 @@ export class ServerNats
     const streamsConfig = this.streams;
 
     for (const streamConfig of streamsConfig) {
-      const stream = streams.find(
-        stream => stream.config.name === streamConfig.name,
-      );
+      const stream = streams.find(stream => stream.config.name === streamConfig.name);
 
       if (!stream) {
         await this.jetstreamManager.streams.add(streamConfig);

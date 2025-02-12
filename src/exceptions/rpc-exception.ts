@@ -1,38 +1,31 @@
 import { HttpStatus } from '@nestjs/common';
-import { NatsRpcExceptionInterface } from 'src/interfaces/nats-rpc-exception.interface';
+import { NatsRpcExceptionInterface } from '../interfaces';
 
 /**
  * @publicApi
  */
 export class NatsRpcException extends Error {
   name = 'NatsRpcException';
-  code?: string;
   message: string;
+  errorCode?: string;
   statusCode?: HttpStatus;
   errors?: any;
 
-  constructor(errOrMessage: NatsRpcExceptionInterface | string | any) {
+  constructor(error: NatsRpcExceptionInterface | string | any) {
     super();
-    if (errOrMessage instanceof NatsRpcException) {
-      Object.assign(this, errOrMessage);
-    } else if (typeof errOrMessage === 'string') {
-      this.message = errOrMessage;
-    } else {
-      const err = errOrMessage.error || errOrMessage.err || errOrMessage;
-
-      let error: Partial<NatsRpcExceptionInterface> = {};
-
-      error.code = err?.code || undefined;
-      error.statusCode = err?.statusCode || err?.status || undefined;
-      error.message = err?.message || err?.err || 'Undefined error';
-      error.errors = err?.errors || undefined;
-
+    if (error instanceof NatsRpcException) {
+      Object.assign(this, error);
+    } else if (typeof error === 'string') {
+      this.message = error;
+    } else if (error && typeof error === 'object') {
       Object.assign(this, {
-        message: error.message,
-        ...(error.code ? { code: error.code } : {}),
-        ...(error.statusCode ? { statusCode: error.statusCode } : {}),
+        message: error.message || 'Unknown error',
+        ...(error.errorCode ? { errorCode: error.errorCode } : {}),
+        ...(error.statusCode || error?.status ? { statusCode: error.statusCode || error?.status } : {}),
         ...(error.errors ? { errors: error.errors } : {}),
       });
+    } else {
+      Object.assign(this, { message: 'Unknown error' });
     }
   }
 }

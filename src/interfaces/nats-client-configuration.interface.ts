@@ -8,5 +8,5 @@ export interface NatsClientConnectionOptions {
   connection: ConnectionOptions;
   serializer?: Serializer;
   deserializer?: Deserializer;
-  useJetStream?: boolean;
+  jetStream?: boolean;
 }

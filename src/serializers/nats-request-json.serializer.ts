@@ -2,13 +2,10 @@ import { isObject } from '@nestjs/common/utils/shared.utils';
 import { NatsCodec } from '@nestjs/microservices/external/nats-client.interface';
 import { ReadPacket } from '@nestjs/microservices/interfaces';
 import { Serializer } from '@nestjs/microservices/interfaces/serializer.interface';
-import {
-  NatsRecord,
-  NatsRecordBuilder,
-} from '@nestjs/microservices/record-builders';
+import { NatsRecord, NatsRecordBuilder } from '@nestjs/microservices/record-builders';
 import { JSONCodec } from 'nats';
 
-export class NatsJSONSerializer implements Serializer<ReadPacket, NatsRecord> {
+export class NatsRequestSerializer implements Serializer<ReadPacket, NatsRecord> {
   private readonly jsonCodec: NatsCodec<unknown>;
 
   constructor() {
@@ -23,7 +20,7 @@ export class NatsJSONSerializer implements Serializer<ReadPacket, NatsRecord> {
 
     return {
       data: this.jsonCodec.encode({ ...packet, data: natsMessage.data }),
-      headers: natsMessage.headers,
+      headers: natsMessage.headers || undefined,
     };
   }
 }
