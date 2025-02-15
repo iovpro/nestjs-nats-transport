@@ -8,6 +8,7 @@ import {
   Server,
   Transport,
   WritePacket,
+  NatsRecordBuilder,
 } from '@nestjs/microservices';
 import { NATS_DEFAULT_URL } from '@nestjs/microservices/constants';
 import {
@@ -25,6 +26,8 @@ import {
   ConsumerUpdateConfig,
   headers as natsMsgHeaders,
   Consumer,
+  MsgHdrs,
+  MsgHdrsImpl,
 } from 'nats';
 import { SimpleMutex } from 'nats/lib/nats-base-client/util';
 import { NatsContext } from '../ctx-host/nats.context';
@@ -481,6 +484,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
 
     const response$ = this.transformToObservable(await handler(incomingMessage.data || incomingMessage, natsCtx));
     const respond = async (response: WritePacket<any>) => {
+      response = this.preparePacketHeaders(response);
       const message: NatsRecord = await this.serializer.serialize({ id: incomingMessage.id, ...response }, {});
       natsMsg.respond(message.data, {
         ...(message.headers ? { headers: message.headers } : {}),
@@ -488,6 +492,40 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     };
 
     this.send(response$, respond);
+  }
+
+  private preparePacketHeaders(packet: WritePacket<any>): WritePacket {
+    if (!packet?.response || !(packet.response instanceof NatsRecord)) return packet;
+    const record = packet.response as NatsRecord;
+
+    if (record.headers && record.headers instanceof MsgHdrsImpl) {
+      return packet;
+    } else if (record.headers) {
+      return { ...packet, response: this.prepareRecord(record.data, record.headers) };
+    } else {
+      return packet;
+    }
+  }
+
+  private prepareRecord(data: any, headers?: Record<string, any>) {
+    if (headers) {
+      const msgHeaders = natsMsgHeaders();
+      this.recordToHeaders(msgHeaders, headers);
+      const recordBuilder = new NatsRecordBuilder();
+      recordBuilder.setData(data);
+      recordBuilder.setHeaders(msgHeaders);
+      return recordBuilder.build();
+    } else {
+      return data;
+    }
+  }
+
+  private recordToHeaders(headers: MsgHdrs, records: Record<string, any>) {
+    for (const [key, value] of Object.entries(records)) {
+      if (!headers.has(key)) {
+        headers.set(key, typeof value === 'string' ? value : JSON.stringify(value));
+      }
+    }
   }
 
   public async handleStatusUpdates(client: NatsConnection) {

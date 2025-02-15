@@ -1,6 +1,6 @@
 {
   "name": "nestjs-nats-transport",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Nats Transport for NestJS with JetStream support",
   "author": "Iaroslav Vorobev",
   "license": "MIT",

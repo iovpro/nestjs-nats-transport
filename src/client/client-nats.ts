@@ -227,6 +227,7 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
   }
 
   private preparePacketHeaders(packet: ReadPacket): ReadPacket {
+    if (!packet?.data || !(packet.data instanceof NatsRecord)) return packet;
     const record =
       packet?.data && isObject(packet.data) && packet.data instanceof NatsRecord
         ? (packet.data as NatsRecord)
