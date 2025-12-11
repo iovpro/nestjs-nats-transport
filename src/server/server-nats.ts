@@ -326,8 +326,10 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       for await (const message of iter) {
         batch.push(message);
       }
-      await this.handleNatsJetStreamBatchEvents(channel, batch, handler, mutex);
-      await mutex.lock();
+      if (batch.length > 0) {
+        await this.handleNatsJetStreamBatchEvents(channel, batch, handler, mutex);
+        await mutex.lock();
+      }
     } catch (err) {
       if (err instanceof NatsError && err.code === NATS_CONNECTION_DRAINING_ERROR_CODE) {
         this.logger.log(`Stopping messages batch consuming due server is draining: channel=${channel}`);
