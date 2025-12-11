@@ -38,7 +38,19 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
   }
 
   public async close() {
-    await this.natsClient?.close();
+    if (!this.natsClient) return;
+
+    try {
+      await this.natsClient.drain();
+    } catch (error) {
+      this.logger.error(
+        error,
+        `Failed to drain the NATS client due to an error, forcibly closing the connection: reason=${error.code}`,
+      );
+
+      await this.natsClient?.close();
+    }
+
     this.natsClient = undefined;
     this.jetstreamClient = undefined;
     this.logger.log('Nats client disconnected');
@@ -186,7 +198,7 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
 
   public async request<TResult = any, TInput = any>(
     pattern: string | string[],
-    data: any,
+    data: TInput,
     headers?: Record<string, any>,
   ): Promise<TResult> {
     const record = this.prepareRecord(data, headers);

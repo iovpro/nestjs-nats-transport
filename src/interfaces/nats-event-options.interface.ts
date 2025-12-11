@@ -3,6 +3,7 @@ import { ConsumerUpdateConfig, DeliverPolicy } from 'nats';
 export enum NakStrategy {
   increment = 'increment',
   regular = 'regular',
+  fibonacci = 'fibonacci',
 }
 
 export interface NatsEventHandlerOptions extends ConsumerUpdateConfig {

@@ -28,13 +28,22 @@ import {
   Consumer,
   MsgHdrs,
   MsgHdrsImpl,
+  NatsError,
 } from 'nats';
 import { SimpleMutex } from 'nats/lib/nats-base-client/util';
 import { NatsContext } from '../ctx-host/nats.context';
 import { NatsResponseSerializer } from '../serializers';
 import { NatsRequestJSONDeserializer } from '../deserializers';
 import { NatsServerConnectionOptions, NakStrategy, NatsEventHandlerOptions } from '../interfaces';
-import { DEFAULT_MAX_NAK_DELAY, DEFAULT_NAK_DELAY, NAK, TERM } from '../constants';
+import {
+  DEFAULT_MAX_NAK_DELAY,
+  DEFAULT_NAK_DELAY,
+  NAK,
+  TERM,
+  NATS_CONNECTION_DRAINING_ERROR_CODE,
+  AUTHORIZATION_VIOLATION_RETRY_DELAY,
+  NATS_AUTHORIZATION_VIOLATION_ERROR_CODE,
+} from '../constants';
 
 /**
  * @publicApi
@@ -79,7 +88,12 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         `Nats server connected to "${this.natsClient.getServer()}" server id "${this.natsClient.info.server_id}"`,
       );
     } catch (err) {
-      callback(err);
+      if (err.code === NATS_AUTHORIZATION_VIOLATION_ERROR_CODE) {
+        this.logger.error(err, 'Authorization violation, retrying in 5 seconds...');
+        setTimeout(() => this.listen(callback), AUTHORIZATION_VIOLATION_RETRY_DELAY);
+      } else {
+        callback(err);
+      }
     }
   }
 
@@ -100,7 +114,19 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   }
 
   public async close() {
-    await this.natsClient?.close();
+    if (!this.natsClient) return;
+
+    try {
+      await this.natsClient.drain();
+    } catch (error) {
+      this.logger.error(
+        error,
+        `Failed to drain the NATS server due to an error, forcibly closing the connection: reason=${error.code}`,
+      );
+
+      await this.natsClient?.close();
+    }
+
     this.natsClient = null;
     this.jetstreamClient = null;
     this.jetstreamManager = null;
@@ -242,8 +268,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       }
 
       if (eventOptions.batch) {
-        const mutex = new SimpleMutex(eventOptions.max_handlers || 1);
-        void this.runBatchSubscription(consumer, channel, handler, eventOptions, mutex);
+        void this.runBatchSubscription(consumer, channel, handler, eventOptions);
         this.logger.log(`Subscribed to [${channel}] JetStream events batch`);
       } else {
         void this.runSubscription(consumer, channel, handler, eventOptions);
@@ -269,9 +294,16 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         void this.handleNatsJetStreamEvent(channel, message, handler, mutex);
       }
     } catch (err) {
-      this.logger.error(err, `Consumer [${channel}] failed`);
-    } finally {
-      if (this.jetstreamClient) void this.runSubscription(consumer, channel, handler, eventOptions);
+      if (err instanceof NatsError && err.code === NATS_CONNECTION_DRAINING_ERROR_CODE) {
+        this.logger.log(`Stopping messages consuming due server is draining: channel=${channel}`);
+        return;
+      }
+
+      this.logger.error(err, `Consumer [${channel}] failed: reason=${err.code}`);
+    }
+
+    if (this.jetstreamClient) {
+      void this.runSubscription(consumer, channel, handler, eventOptions);
     }
   }
 
@@ -280,8 +312,8 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     channel: string,
     handler: MessageHandler<any, any, any>,
     eventOptions: NatsEventHandlerOptions,
-    mutex: SimpleMutex,
   ) {
+    const mutex = new SimpleMutex(1);
     try {
       await mutex.lock();
       const expires = eventOptions.batch_expires || 1000;
@@ -294,16 +326,23 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       for await (const message of iter) {
         batch.push(message);
       }
-      void this.handleNatsJetStreamBatchEvents(channel, batch, handler, mutex);
+      await this.handleNatsJetStreamBatchEvents(channel, batch, handler, mutex);
+      await mutex.lock();
     } catch (err) {
+      if (err instanceof NatsError && err.code === NATS_CONNECTION_DRAINING_ERROR_CODE) {
+        this.logger.log(`Stopping messages batch consuming due server is draining: channel=${channel}`);
+        return;
+      }
+
       this.logger.error(err, `Batch consumer [${channel}] failed`);
-      mutex.unlock();
-    } finally {
-      if (this.jetstreamClient) void this.runBatchSubscription(consumer, channel, handler, eventOptions, mutex);
+    }
+
+    if (this.jetstreamClient) {
+      void this.runBatchSubscription(consumer, channel, handler, eventOptions);
     }
   }
 
-  private getEventHandler(channel: string, handler: MessageHandler<any, any, any>): Function {
+  private getEventHandler(channel: string, handler: MessageHandler<any, any, any>) {
     return async (error: object | undefined, message: Msg) => {
       if (error) {
         return this.logger.error(error);
@@ -312,13 +351,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     };
   }
 
-  // private getJetStreamEventHandler(channel: string, handler: MessageHandler<any, any, any>): Function {
-  //   return async (message: JsMsg) => {
-  //     return this.handleNatsJetStreamEvent(channel, message, handler);
-  //   };
-  // }
-
-  private getRequestHandler(channel: string, handler: MessageHandler<any, any, any>): Function {
+  private getRequestHandler(channel: string, handler: MessageHandler<any, any, any>) {
     return async (error: object | undefined, message: Msg) => {
       if (error) {
         return this.logger.error(error);
@@ -329,7 +362,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
 
   public async handleNatsEvent(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
     try {
-      const natsCtx = new NatsContext([natsMsg.subject, natsMsg.headers]);
+      const natsCtx = new NatsContext([natsMsg]);
       const message = await this.deserializer.deserialize(natsMsg.data, {
         channel,
         replyTo: natsMsg.reply,
@@ -358,7 +391,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     try {
       natsMsg.working();
 
-      const natsCtx = new NatsContext([natsMsg.subject, natsMsg.headers]);
+      const natsCtx = new NatsContext([natsMsg]);
       const message = await this.deserializer.deserialize(natsMsg.data, {
         channel,
         headers: natsMsg.headers,
@@ -384,8 +417,12 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
 
       this.send(response$, respond);
     } catch (err) {
-      this.logger.error(err, 'Incorrect event data');
-      natsMsg.term('Incorrect event data');
+      this.logger.error(err, 'Failed to process event data');
+      try {
+        natsMsg.term('Failed to process event data');
+      } catch (e) {
+        this.logger.error(e, 'Failed to term failed nats msg');
+      }
       mutex.unlock();
     }
   }
@@ -424,7 +461,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         return;
       }
 
-      const natsCtx = new NatsContext([validNatsMsgs[0].subject, natsMsgHeaders()]);
+      const natsCtx = new NatsContext([validNatsMsgs[0]]);
       const response$ = this.transformToObservable(await handler(messages, natsCtx));
 
       const respond = async (response: WritePacket<any>) => {
@@ -445,7 +482,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
 
       this.send(response$, respond);
     } catch (err) {
-      this.logger.error(err, 'Incorrect batch data');
+      this.logger.error(err, 'Failed to process batch event data');
       try {
         batchMsgs.forEach(async natsMsg => {
           natsMsg.nak(this.calculateNakDelay(natsMsg, eventOptions));
@@ -457,6 +494,11 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     }
   }
 
+  private fibonacciApproximation(n: number): number {
+    const phi = (1 + Math.sqrt(5)) / 2;
+    return Math.round(Math.pow(phi, n) / Math.sqrt(5));
+  }
+
   private calculateNakDelay(natsMsg: JsMsg, { nak_strategy, nak_delay, nak_delay_max }: NatsEventHandlerOptions) {
     const strategy: NakStrategy = nak_strategy || NakStrategy.regular;
     nak_delay = nak_delay || DEFAULT_NAK_DELAY;
@@ -465,17 +507,18 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     if (strategy === NakStrategy.regular) {
       return nak_delay;
     } else if (strategy === NakStrategy.increment) {
-      const delay = natsMsg.info.redeliveryCount * nak_delay;
-
-      if (delay > nak_delay_max) return nak_delay_max;
-      else return delay;
+      const delay = natsMsg.info.deliveryCount * nak_delay;
+      return delay > nak_delay_max ? nak_delay_max : delay;
+    } else if (strategy === NakStrategy.fibonacci) {
+      const delay = this.fibonacciApproximation(natsMsg.info.deliveryCount) * nak_delay;
+      return delay > nak_delay_max ? nak_delay_max : delay;
     }
   }
 
   public async handleRequest(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
     const replyTo = natsMsg.reply;
 
-    const natsCtx = new NatsContext([natsMsg.subject, natsMsg.headers]);
+    const natsCtx = new NatsContext([natsMsg]);
     const incomingMessage: IncomingRequest = (await this.deserializer.deserialize(natsMsg.data, {
       channel,
       replyTo,
