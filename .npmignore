@@ -1,6 +1,7 @@
 # source
 **/*.ts
 *.ts
+src
 
 # definitions
 !**/*.d.ts
@@ -13,3 +14,7 @@ node_modules
 tsconfig.json
 tsconfig.tsbuildinfo
 yarn.lock
+
+# AI
+CLAUDE.md
+.claude/
