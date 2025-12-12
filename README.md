@@ -82,6 +82,7 @@ bootstrap();
 ```typescript
 // user.controller.ts
 import { Controller } from '@nestjs/common';
+import { Payload, Ctx } from '@nestjs/microservices';
 import {
   NatsMessagePattern,
   NatsEventPattern,
@@ -92,7 +93,7 @@ import {
 export class UserController {
   // RPC handler - returns response
   @NatsMessagePattern('user.get')
-  async getUser(data: { id: string }, ctx: NatsContext) {
+  async getUser(@Payload() data: { id: string }, @Ctx() ctx: NatsContext) {
     const subject = ctx.getSubject(); // 'user.get'
     return {
       id: data.id,
@@ -103,7 +104,7 @@ export class UserController {
 
   // Event handler - no response
   @NatsEventPattern('user.created')
-  async handleUserCreated(data: { userId: string }, ctx: NatsContext) {
+  async handleUserCreated(@Payload() data: { userId: string }, @Ctx() ctx: NatsContext) {
     console.log(`New user created: ${data.userId}`);
     // Process event without returning response
   }
@@ -479,13 +480,14 @@ Use `@NatsMessagePattern()` to create handlers that return a response to the cli
 
 ```typescript
 import { Controller } from '@nestjs/common';
+import { Payload, Ctx } from '@nestjs/microservices';
 import { NatsMessagePattern, NatsContext } from 'nestjs-nats-transport';
 
 @Controller()
 export class OrderController {
   // Simple RPC handler
   @NatsMessagePattern('order.get')
-  async getOrder(data: { orderId: string }, ctx: NatsContext) {
+  async getOrder(@Payload() data: { orderId: string }, @Ctx() ctx: NatsContext) {
     const subject = ctx.getSubject(); // 'order.get'
 
     return {
@@ -497,7 +499,7 @@ export class OrderController {
 
   // Handler with array pattern
   @NatsMessagePattern(['order', 'create'])
-  async createOrder(data: CreateOrderDto, ctx: NatsContext) {
+  async createOrder(@Payload() data: CreateOrderDto, @Ctx() ctx: NatsContext) {
     // Data validation
     if (!data.items || data.items.length === 0) {
       throw new NatsRpcException({
@@ -513,7 +515,7 @@ export class OrderController {
 
   // Return data with headers
   @NatsMessagePattern('order.process')
-  async processOrder(data: { orderId: string }, ctx: NatsContext) {
+  async processOrder(@Payload() data: { orderId: string }, @Ctx() ctx: NatsContext) {
     const order = await this.orderService.process(data.orderId);
 
     // Return NatsRecord with headers
@@ -525,7 +527,7 @@ export class OrderController {
 
   // Async processing with external dependencies
   @NatsMessagePattern('order.validate')
-  async validateOrder(data: ValidateOrderDto, ctx: NatsContext) {
+  async validateOrder(@Payload() data: ValidateOrderDto, @Ctx() ctx: NatsContext) {
     // Check inventory availability
     const available = await this.inventoryService.checkAvailability(
       data.items,
@@ -559,20 +561,22 @@ Use `@NatsEventPattern()` to handle events without returning a response.
 #### Traditional NATS Pub/Sub
 
 ```typescript
+import { Payload, Ctx } from '@nestjs/microservices';
+
 @Controller()
 export class UserController {
   constructor(private readonly emailService: EmailService) {}
 
   // Simple event handler
   @NatsEventPattern('user.registered')
-  async handleUserRegistered(data: { userId: string, email: string }) {
+  async handleUserRegistered(@Payload() data: { userId: string, email: string }) {
     await this.emailService.sendWelcomeEmail(data.email);
     console.log(`Welcome email sent to user ${data.userId}`);
   }
 
   // Event handler with wildcard topics
   @NatsEventPattern('user.profile.*')
-  async handleProfileEvents(data: any, ctx: NatsContext) {
+  async handleProfileEvents(@Payload() data: any, @Ctx() ctx: NatsContext) {
     const subject = ctx.getSubject();
 
     // subject can be: 'user.profile.updated', 'user.profile.deleted', etc.
@@ -581,7 +585,7 @@ export class UserController {
 
   // Processing with header access
   @NatsEventPattern('user.action')
-  async handleUserAction(data: any, ctx: NatsContext) {
+  async handleUserAction(@Payload() data: any, @Ctx() ctx: NatsContext) {
     const headers = ctx.getHeaders();
     const userId = headers?.get('user-id');
     const timestamp = headers?.get('timestamp');
@@ -597,11 +601,13 @@ JetStream provides guaranteed delivery, persistence, and consumer state manageme
 
 ```typescript
 import { Controller, HttpStatus } from '@nestjs/common';
+import { Payload } from '@nestjs/microservices';
 import {
   NatsEventPattern,
   NatsContext,
   NAK,
   TERM,
+  NakStrategy,
 } from 'nestjs-nats-transport';
 import { DeliverPolicy } from 'nats';
 
@@ -612,7 +618,7 @@ export class OrderController {
     deliver_policy: DeliverPolicy.New, // Only new messages
     nak_delay: 2000, // Delay before retry on error
   })
-  async handleOrderCreated(data: { orderId: string }) {
+  async handleOrderCreated(@Payload() data: { orderId: string }) {
     await this.processOrder(data.orderId);
     // On success, ack() is automatically called
   }
@@ -620,11 +626,11 @@ export class OrderController {
   // Handler with acknowledgment management
   @NatsEventPattern('orders.payment', {
     deliver_policy: DeliverPolicy.New,
-    nak_strategy: 'increment', // Incremental delay on retries
+    nak_strategy: NakStrategy.increment, // Incremental delay on retries (type-safe enum)
     nak_delay: 1000, // Initial delay
     nak_delay_max: 60000, // Maximum delay
   })
-  async handlePayment(data: { orderId: string, amount: number }) {
+  async handlePayment(@Payload() data: { orderId: string, amount: number }) {
     try {
       const success = await this.paymentService.charge(
         data.orderId,
@@ -656,7 +662,7 @@ export class OrderController {
     max_handlers: 10, // Process up to 10 messages concurrently
     ack_wait: 30_000_000_000, // 30 seconds in nanoseconds
   })
-  async processOrders(data: OrderData) {
+  async processOrders(@Payload() data: OrderData) {
     // Long processing...
     await this.heavyProcessing(data)
   }
@@ -668,7 +674,7 @@ export class OrderController {
     batch_expires: 5000, // Batch timeout (ms)
     max_handlers: 3, // Parallel batches
   })
-  async processOrdersBatch(messages: OrderData[]) {
+  async processOrdersBatch(@Payload() messages: OrderData[]) {
     console.log(`Processing batch of ${messages.length} orders`);
 
     // Process entire batch at once
@@ -683,7 +689,7 @@ export class OrderController {
     durable_name: 'order-history-rebuild',
     max_handlers: 1, // Sequential processing
   })
-  async rebuildOrderHistory(data: OrderData) {
+  async rebuildOrderHistory(@Payload() data: OrderData) {
     await this.historyService.rebuild(data);
   }
 
@@ -693,7 +699,7 @@ export class OrderController {
     opt_start_seq: 1000, // Start from message #1000
     durable_name: 'order-replay',
   });
-  async replayOrders(data: OrderData) {
+  async replayOrders(@Payload() data: OrderData) {
     await this.replayService.process(data);
   }
 
@@ -702,7 +708,7 @@ export class OrderController {
     filter_subject: 'orders.created', // Only orders.created from stream
     deliver_policy: DeliverPolicy.New,
   });
-  async handleOrderNotifications(data: OrderData) {
+  async handleOrderNotifications(@Payload() data: OrderData) {
     await this.notificationService.send(data);
   }
 }
@@ -714,6 +720,9 @@ To apply common settings to all JetStream handlers, use `globalEventOptions`:
 
 ```typescript
 // main.ts
+import { DeliverPolicy } from 'nats';
+import { ServerNats, NakStrategy } from 'nestjs-nats-transport';
+
 const app = await NestFactory.createMicroservice<MicroserviceOptions>(
   AppModule,
   {
@@ -726,7 +735,7 @@ const app = await NestFactory.createMicroservice<MicroserviceOptions>(
       globalEventOptions: {
         deliver_policy: DeliverPolicy.New,
         nak_delay: 2000,
-        nak_strategy: 'increment',
+        nak_strategy: NakStrategy.increment,
         max_handlers: 5,
         ack_wait: 30_000_000_000, // 30 seconds
       },
@@ -743,7 +752,7 @@ Settings in decorators override global settings:
   nak_delay: 500,  // Overrides globalEventOptions
   // deliver_policy and nak_strategy inherited from globalEventOptions
 })
-async handleCriticalOrders(data: OrderData) {
+async handleCriticalOrders(@Payload() data: OrderData) {
   // ...
 }
 ```
@@ -865,16 +874,20 @@ import { DeliverPolicy } from 'nats';
 
 #### NAK Strategies (Retry Strategies)
 
+You can use either the `NakStrategy` enum (recommended for type safety) or string literals:
+
 ```typescript
-// Regular - fixed delay
+import { NakStrategy } from 'nestjs-nats-transport';
+
+// Regular - fixed delay (using enum)
 @NatsEventPattern('orders.process', {
-  nak_strategy: 'regular',
+  nak_strategy: NakStrategy.regular,
   nak_delay: 5000, // Always wait 5 seconds before retry
 })
 
 // Increment - incremental delay (linear backoff)
 @NatsEventPattern('orders.process', {
-  nak_strategy: 'increment',
+  nak_strategy: NakStrategy.increment,
   nak_delay: 1000,     // Base delay: 1 second
   nak_delay_max: 60000, // Maximum 60 seconds
 })
@@ -882,11 +895,17 @@ import { DeliverPolicy } from 'nats';
 
 // Fibonacci - exponential backoff using Fibonacci sequence
 @NatsEventPattern('orders.process', {
-  nak_strategy: 'fibonacci',
+  nak_strategy: NakStrategy.fibonacci,
   nak_delay: 1000,     // Base delay: 1 second
   nak_delay_max: 60000, // Maximum 60 seconds
 })
 // Delays: 1s → 1s → 2s → 3s → 5s → 8s → 13s → 21s → 34s → 55s → 60s (max)
+
+// Alternative: using string literals (also valid)
+@NatsEventPattern('orders.process', {
+  nak_strategy: 'regular', // 'regular' | 'increment' | 'fibonacci'
+  nak_delay: 5000,
+})
 ```
 
 #### Acknowledgment Management
@@ -902,7 +921,7 @@ import { DeliverPolicy } from 'nats';
   // Maximum unacknowledged messages for this consumer
   max_ack_pending: 100,
 });
-async handleOrder(data: OrderData) {
+async handleOrder(@Payload() data: OrderData) {
   // Explicit acknowledgment management:
 
   if (data.invalid) {
@@ -923,7 +942,7 @@ async handleOrder(data: OrderData) {
 @NatsEventPattern('orders.heavy', {
   max_handlers: 10, // Process up to 10 messages concurrently
 })
-async heavyProcessing(data: OrderData) {
+async heavyProcessing(@Payload() data: OrderData) {
   // Long operation...
   // SimpleMutex controls that no more than 10 handlers work simultaneously
 }
@@ -938,7 +957,7 @@ async heavyProcessing(data: OrderData) {
   batch_expires: 5000,    // Wait timeout (ms)
   max_handlers: 3,        // Number of parallel batches
 })
-async processBatch(messages: OrderData[]) {
+async processBatch(@Payload() messages: OrderData[]) {
   // messages - array of 1 to 100 elements
   // 5 second timeout means: if 100 messages haven't accumulated in 5 seconds,
   // process what we have
@@ -958,7 +977,7 @@ Durable consumers preserve their state (position in stream) even after applicati
   durable_name: 'order-processor-v1', // Unique consumer name
   deliver_policy: DeliverPolicy.All,
 });
-async processOrder(data: OrderData) {
+async processOrder(@Payload() data: OrderData) {
   // On application restart, processing continues from where it stopped
 }
 ```
@@ -1065,7 +1084,7 @@ The library automatically applies `NatsRpcExceptionInterceptor` to all handlers:
 @Controller()
 export class UserController {
   @NatsMessagePattern('user.get');
-  async getUser(data: { id: string }) {
+  async getUser(@Payload() data: { id: string }) {
     // Any error is automatically wrapped in RpcException
     const user = await this.userService.findById(data.id)
 
@@ -1153,10 +1172,10 @@ For events (no response), errors don't return to the client but control NAK/ACK:
 
 ```typescript
 @NatsEventPattern('orders.process', {
-  nak_strategy: 'increment',
+  nak_strategy: NakStrategy.increment,
   max_deliver: 5,
 });
-async processOrder(data: OrderData) {
+async processOrder(@Payload() data: OrderData) {
   try {
     await this.orderService.process(data);
     // Success - automatic ack()
@@ -1210,10 +1229,12 @@ export class OrderService {
 ### Reading Headers on Server
 
 ```typescript
+import { Payload, Ctx } from '@nestjs/microservices';
+
 @Controller()
 export class OrderController {
   @NatsMessagePattern('orders.create');
-  async createOrder(data: CreateOrderDto, ctx: NatsContext) {
+  async createOrder(@Payload() data: CreateOrderDto, @Ctx() ctx: NatsContext) {
     // Get all headers
     const headers = ctx.getHeaders()
 
@@ -1236,7 +1257,7 @@ export class OrderController {
   }
 
   @NatsEventPattern('user.action');
-  async handleAction(data: any, ctx: NatsContext) {
+  async handleAction(@Payload() data: any, @Ctx() ctx: NatsContext) {
     const headers = ctx.getHeaders();
 
     // Iterate over all headers
@@ -1252,12 +1273,13 @@ export class OrderController {
 ### Returning Headers in Response
 
 ```typescript
+import { Payload, Ctx } from '@nestjs/microservices';
 import { NatsRecord } from 'nestjs-nats-transport';
 
 @Controller()
 export class OrderController {
   @NatsMessagePattern('orders.get');
-  async getOrder(data: { orderId: string }, ctx: NatsContext) {
+  async getOrder(@Payload() data: { orderId: string }, @Ctx() ctx: NatsContext) {
     const order = await this.orderService.findById(data.orderId);
 
     // Return data with headers
@@ -1269,7 +1291,7 @@ export class OrderController {
   }
 
   @NatsMessagePattern('orders.process');
-  async processOrder(data: ProcessOrderDto, ctx: NatsContext) {
+  async processOrder(@Payload() data: ProcessOrderDto, @Ctx() ctx: NatsContext) {
     const startTime = Date.now();
 
     const result = await this.orderService.process(data);
@@ -1289,12 +1311,14 @@ export class OrderController {
 ### Propagating Headers Between Services
 
 ```typescript
+import { Payload, Ctx } from '@nestjs/microservices';
+
 @Injectable()
 export class OrderService {
   constructor(@Inject('ClientNats') private client: ClientNats) {}
 
   @NatsMessagePattern('orders.create');
-  async createOrder(data: CreateOrderDto, ctx: NatsContext) {
+  async createOrder(@Payload() data: CreateOrderDto, @Ctx() ctx: NatsContext) {
     // Get headers from client
     const incomingHeaders = ctx.getHeaders()
 
@@ -1368,7 +1392,7 @@ export class TypedService {
   }
 
   @NatsMessagePattern('service.method');
-  async handleRequest(data: any, ctx: NatsContext) {
+  async handleRequest(@Payload() data: any, @Ctx() ctx: NatsContext) {
     const headers = ctx.getHeaders();
     const userId = headers?.get('user-id') as string;
 
@@ -1423,6 +1447,7 @@ Controller with both protocols:
 
 ```typescript
 import { Controller, Get, Post, Body, Param } from '@nestjs/common';
+import { Payload } from '@nestjs/microservices';
 import { NatsMessagePattern, NatsEventPattern } from 'nestjs-nats-transport';
 
 @Controller('orders');
@@ -1435,7 +1460,7 @@ export class OrderController {
 
   // NATS RPC handler (same functionality)
   @NatsMessagePattern('orders.get')
-  async getOrderNats(data: { id: string }) {
+  async getOrderNats(@Payload() data: { id: string }) {
     return this.orderService.findById(data.id);
   }
 
@@ -1454,7 +1479,7 @@ export class OrderController {
 
   // NATS event handler for processing created orders
   @NatsEventPattern('orders.created')
-  async handleOrderCreated(data: { orderId: string }) {
+  async handleOrderCreated(@Payload() data: { orderId: string }) {
     await this.analyticsService.trackOrder(data.orderId);
   }
 }
@@ -1640,10 +1665,12 @@ Distributed transaction through events:
 
 ```typescript
 // order-saga.service.ts
+import { Payload } from '@nestjs/microservices';
+
 @Injectable()
 export class OrderSagaService {
   @NatsEventPattern('saga.order.start');
-  async startOrderSaga(data: { orderId: string }) {
+  async startOrderSaga(@Payload() data: { orderId: string }) {
     try {
       // Step 1: Reserve inventory
       await this.client.request('inventory.reserve', {
@@ -1682,7 +1709,7 @@ export class OrderSagaService {
   }
 
   @NatsEventPattern('saga.order.failed');
-  async compensate(data: { orderId: string }) {
+  async compensate(@Payload() data: { orderId: string }) {
     // Compensating transactions in reverse order
     await this.client.event('delivery.cancel', data)
     await this.client.event('payment.refund', data);
@@ -1813,7 +1840,7 @@ export class TracingService {
   }
 
   @NatsMessagePattern('orders.process');
-  async handleRequest(data: any, ctx: NatsContext) {
+  async handleRequest(@Payload() data: any, @Ctx() ctx: NatsContext) {
     // Extract trace context from headers
     const headers = ctx.getHeaders()
     const traceparent = headers?.get('traceparent');
@@ -1917,7 +1944,7 @@ Decorator for RPC handlers (request-response).
 **Example:**
 ```typescript
 @NatsMessagePattern('user.get');
-async getUser(data: { id: string }, ctx: NatsContext) {
+async getUser(@Payload() data: { id: string }, @Ctx() ctx: NatsContext) {
   return { id: data.id, name: 'John' };
 }
 ```
@@ -1943,7 +1970,7 @@ Decorator for event handlers (fire-and-forget).
   deliver_policy: DeliverPolicy.New,
   max_handlers: 5,
 });
-async handleUserCreated(data: { userId: string }, ctx: NatsContext) {
+async handleUserCreated(@Payload() data: { userId: string }, @Ctx() ctx: NatsContext) {
   console.log('User created:', data.userId);
 }
 ```
@@ -1960,7 +1987,8 @@ interface NatsEventHandlerOptions extends ConsumerUpdateConfig {
   max_messages?: number;               // Max messages in batch (default: 100)
   nak_delay?: number;                  // NAK delay in ms (default: 1000)
   nak_delay_max?: number;              // Max NAK delay in ms (default: 60000)
-  nak_strategy?: NakStrategy;          // NAK strategy: 'regular' | 'increment' | 'fibonacci' (default: 'regular')
+  nak_strategy?: NakStrategy;          // NAK strategy: NakStrategy.regular | NakStrategy.increment | NakStrategy.fibonacci
+                                       // Or string: 'regular' | 'increment' | 'fibonacci' (default: 'regular')
   max_handlers?: number;               // Parallel handlers (default: 1)
   batch?: boolean;                     // Batch mode (default: false)
   batch_expires?: number;              // Batch timeout in ms (default: 1000)
@@ -1999,7 +2027,7 @@ Handler execution context.
 **Example:**
 ```typescript
 @NatsMessagePattern('order.get');
-async getOrder(data: any, ctx: NatsContext) {
+async getOrder(@Payload() data: any, @Ctx() ctx: NatsContext) {
   const message = ctx.getMessage();       // Native NATS message
   const subject = ctx.getSubject();        // 'order.get'
   const headers = ctx.getHeaders()        // MsgHdrs object or undefined
@@ -2044,19 +2072,30 @@ throw new NatsRpcException({
 
 ---
 
-### Constants
+### Constants and Enums
 
+#### Symbols
 - `NAK` - Symbol for returning NAK from event handler
 - `TERM` - Symbol for returning TERM from event handler
 - `DEFAULT_NAK_DELAY` - 1000 (ms);
 - `DEFAULT_MAX_NAK_DELAY` - 60000 (ms);
 
+#### NakStrategy Enum
+Type-safe enum for specifying retry strategies:
+- `NakStrategy.regular` - Fixed delay between retries
+- `NakStrategy.increment` - Linear backoff (1s, 2s, 3s, 4s...)
+- `NakStrategy.fibonacci` - Fibonacci sequence backoff (1s, 1s, 2s, 3s, 5s, 8s...)
+
 **Example:**
 ```typescript
-import { NAK, TERM } from 'nestjs-nats-transport';
+import { NAK, TERM, NakStrategy } from 'nestjs-nats-transport';
 
-@NatsEventPattern('order.process');
-async processOrder(data: OrderData) {
+@NatsEventPattern('order.process', {
+  nak_strategy: NakStrategy.increment, // Type-safe enum usage
+  nak_delay: 1000,
+  max_deliver: 5,
+});
+async processOrder(@Payload() data: OrderData) {
   if (data.invalid) {
     return TERM; // Don't retry
   }
