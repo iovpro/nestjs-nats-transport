@@ -1041,6 +1041,75 @@ for (const stream of streams) {
 
 ## Error Handling
 
+### Request Validation
+
+The library provides `RequestValidationPipe` for automatic request validation with NestJS class-validator:
+
+```typescript
+// main.ts
+import { NestFactory } from '@nestjs/core';
+import { MicroserviceOptions } from '@nestjs/microservices';
+import { ServerNats, RequestValidationPipe } from 'nestjs-nats-transport';
+
+async function bootstrap() {
+  const app = await NestFactory.createMicroservice<MicroserviceOptions>(
+    AppModule,
+    {
+      strategy: new ServerNats({
+        consumerName: 'user-service',
+        connection: { servers: ['nats://localhost:4222'] },
+      }),
+    },
+  );
+
+  // Apply validation pipe globally
+  app.useGlobalPipes(RequestValidationPipe());
+
+  await app.listen();
+}
+```
+
+When validation fails, `NatsRpcException` is thrown with detailed error information:
+
+```typescript
+// DTO with validation rules
+import { IsEmail, IsString, MinLength } from 'class-validator';
+
+export class CreateUserDto {
+  @IsEmail()
+  email: string;
+
+  @IsString()
+  @MinLength(3)
+  name: string;
+}
+
+// Handler
+@NatsMessagePattern('user.create')
+async createUser(@Payload() data: CreateUserDto) {
+  // data is already validated
+  return this.userService.create(data);
+}
+```
+
+Validation error response format:
+
+```json
+{
+  "message": "Validation error",
+  "errorCode": "VALIDATION_ERROR",
+  "statusCode": 400,
+  "errors": {
+    "email": ["email must be an email"],
+    "name": ["name must be longer than or equal to 3 characters"]
+  }
+}
+```
+
+The pipe supports nested object validation - errors for nested properties are returned in a hierarchical structure.
+
+---
+
 ### NatsRpcException
 
 Standardized error format for RPC communication:
