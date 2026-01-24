@@ -18,7 +18,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/iovpro/nestjs-nats-transport.git"
+    "url": "git+https://github.com/iovpro/nestjs-nats-transport.git"
   },
   "bugs": {
     "url": "https://github.com/iovpro/nestjs-nats-transport/issues"
