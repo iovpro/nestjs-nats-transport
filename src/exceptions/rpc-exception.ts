@@ -18,11 +18,14 @@ export class NatsRpcException extends Error {
     } else if (typeof error === 'string') {
       this.message = error;
     } else if (error && typeof error === 'object') {
+      // Unwrap nested error from RpcException serialization
+      const source = error.error && typeof error.error === 'object' ? error.error : error;
+
       Object.assign(this, {
-        message: error.message || 'Unknown error',
-        ...(error.errorCode ? { errorCode: error.errorCode } : {}),
-        ...(error.statusCode || error?.status ? { statusCode: error.statusCode || error?.status } : {}),
-        ...(error.errors ? { errors: error.errors } : {}),
+        message: source.message || 'Unknown error',
+        ...(source.errorCode ? { errorCode: source.errorCode } : {}),
+        ...(source.statusCode || source?.status ? { statusCode: source.statusCode || source?.status } : {}),
+        ...(source.errors ? { errors: source.errors } : {}),
       });
     } else {
       Object.assign(this, { message: 'Unknown error' });
