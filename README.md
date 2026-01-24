@@ -1933,6 +1933,63 @@ export class TracingService {
 
 ## API Reference
 
+### Utilities
+
+#### toMs
+
+Converts time values to milliseconds. Useful for configuring timeouts, delays, and JetStream options.
+
+```typescript
+import { toMs } from 'nestjs-nats-transport';
+
+toMs(5, 's')   // 5000 (5 seconds)
+toMs(2, 'm')   // 120000 (2 minutes)
+toMs(1, 'h')   // 3600000 (1 hour)
+toMs(1, 'd')   // 86400000 (1 day)
+toMs(1, 'w')   // 604800000 (1 week)
+toMs(500, 'ms') // 500 (milliseconds)
+```
+
+**Supported units:**
+- `ns` - nanoseconds (returns as-is)
+- `ms` - milliseconds
+- `s` - seconds
+- `m` - minutes
+- `h` - hours
+- `d` - days
+- `w` - weeks
+- `y` - years
+
+**Usage examples:**
+
+```typescript
+// JetStream event handler configuration
+@NatsEventPattern('orders.process', {
+  nak_delay: toMs(5, 's'),        // 5 seconds
+  nak_delay_max: toMs(1, 'm'),    // 1 minute
+  batch_expires: toMs(10, 's'),   // 10 seconds
+})
+
+// Timeout configuration
+const TIMEOUT = toMs(30, 's'); // 30 seconds
+```
+
+#### bytes
+
+Converts size values to bytes.
+
+```typescript
+import { bytes } from 'nestjs-nats-transport';
+
+bytes(1, 'kb')  // 1024
+bytes(5, 'mb')  // 5242880
+bytes(1, 'gb')  // 1073741824
+```
+
+**Supported units:** `b`, `kb`, `mb`, `gb`
+
+---
+
 ### ServerNats
 
 Server-side transport strategy for NATS.
