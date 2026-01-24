@@ -1974,6 +1974,43 @@ toMs(500, 'ms') // 500 (milliseconds)
 const TIMEOUT = toMs(30, 's'); // 30 seconds
 ```
 
+#### toNs
+
+Converts time values to nanoseconds. Useful for JetStream configuration options like `ack_wait`, `idle_heartbeat`, `max_age`, etc.
+
+```typescript
+import { toNs } from 'nestjs-nats-transport';
+
+toNs(5, 's')   // 5_000_000_000 (5 seconds)
+toNs(30, 'm')  // 1_800_000_000_000 (30 minutes)
+toNs(1, 'h')   // 3_600_000_000_000 (1 hour)
+toNs(7, 'd')   // 604_800_000_000_000 (7 days)
+toNs(100, 'ms') // 100_000_000 (100 milliseconds)
+```
+
+**Supported units:** same as `toMs` (`ns`, `ms`, `s`, `m`, `h`, `d`, `w`, `y`)
+
+**Usage examples:**
+
+```typescript
+// JetStream consumer configuration
+@NatsEventPattern('orders.process', {
+  ack_wait: toNs(30, 's'),           // 30 seconds to acknowledge
+  idle_heartbeat: toNs(5, 's'),      // 5 seconds heartbeat interval
+  inactive_threshold: toNs(1, 'h'),  // 1 hour inactivity threshold
+})
+
+// Stream configuration
+await serverNats.setupStreams([
+  {
+    name: 'ORDERS',
+    subjects: ['orders.*'],
+    max_age: toNs(7, 'd'),              // Keep messages for 7 days
+    duplicate_window: toNs(2, 'm'),     // 2 minutes deduplication window
+  },
+]);
+```
+
 #### bytes
 
 Converts size values to bytes.
