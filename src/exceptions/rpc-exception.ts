@@ -1,5 +1,8 @@
 import { HttpStatus } from '@nestjs/common';
 import { NatsRpcExceptionInterface } from '../interfaces';
+import { RpcException } from '@nestjs/microservices';
+
+export type NatsRpcExceptionInput = Partial<NatsRpcExceptionInterface> | RpcException | Error | string;
 
 /**
  * @publicApi
@@ -11,24 +14,26 @@ export class NatsRpcException extends Error {
   statusCode?: HttpStatus;
   errors?: any;
 
-  constructor(error: NatsRpcExceptionInterface | string | any) {
+  constructor(error: NatsRpcExceptionInput) {
     super();
     if (error instanceof NatsRpcException) {
       Object.assign(this, error);
     } else if (typeof error === 'string') {
       this.message = error;
     } else if (error && typeof error === 'object') {
-      // Unwrap nested error from RpcException serialization
-      const source = error.error && typeof error.error === 'object' ? error.error : error;
-
-      Object.assign(this, {
-        message: source.message || 'Unknown error',
-        ...(source.errorCode ? { errorCode: source.errorCode } : {}),
-        ...(source.statusCode || source?.status ? { statusCode: source.statusCode || source?.status } : {}),
-        ...(source.errors ? { errors: source.errors } : {}),
-      });
+      this.assignFromObject(error as unknown as Record<string, unknown>);
     } else {
       Object.assign(this, { message: 'Unknown error' });
     }
+  }
+
+  private assignFromObject(obj: Record<string, unknown>): void {
+    // Unwrap nested error from RpcException serialization
+    const source = (obj.error && typeof obj.error === 'object' ? obj.error : obj) as Record<string, unknown>;
+
+    this.message = String(source.message || 'Unknown error');
+    if (source.errorCode) this.errorCode = source.errorCode as string;
+    if (source.statusCode || source.status) this.statusCode = (source.statusCode || source.status) as HttpStatus;
+    if (source.errors) this.errors = source.errors;
   }
 }

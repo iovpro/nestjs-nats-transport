@@ -14,7 +14,8 @@ export class NatsRpcExceptionInterceptor implements NestInterceptor {
       catchError(err => {
         if (context.getType() !== 'rpc') return throwError(() => err);
         this.logException(context, err);
-        return throwError(() => new RpcException(new NatsRpcException(err)));
+        const natsException = err instanceof NatsRpcException ? err : new NatsRpcException(err);
+        return throwError(() => new RpcException(natsException));
       }),
     );
   }
