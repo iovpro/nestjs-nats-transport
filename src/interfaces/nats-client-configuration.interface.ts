@@ -9,4 +9,5 @@ export interface NatsClientConnectionOptions {
   serializer?: Serializer;
   deserializer?: Deserializer;
   jetStream?: boolean;
+  requestTimeout?: number;
 }

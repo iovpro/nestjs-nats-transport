@@ -1,6 +1,6 @@
 {
   "name": "nestjs-nats-transport",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "Nats Transport for NestJS with JetStream support",
   "author": "Iaroslav Vorobev",
   "license": "MIT",
@@ -28,31 +28,43 @@
   },
   "scripts": {
     "build": "rimraf dist && rimraf tsconfig.tsbuildinfo && tsc",
+    "prepublishOnly": "yarn build",
     "format": "prettier \"**/*.ts\" --ignore-path ./.prettierignore --write && git status",
-    "lint": "eslint 'src/**/**.ts' --ignore-pattern 'src/**/*.spec.ts' --fix"
-  },
-  "dependencies": {
-    "nats": "^2.29.2"
+    "lint": "eslint 'src/**/**.ts' --ignore-pattern 'src/**/*.spec.ts' --fix",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:e2e": "jest --config test/jest-e2e.config.js --runInBand",
+    "test:e2e:infra:up": "bash test/scripts/infra.sh up",
+    "test:e2e:infra:down": "bash test/scripts/infra.sh down",
+    "test:compat": "bash test/compat/check-nest-compat.sh",
+    "test:e2e:nest": "bash test/compat/e2e-with-nest.sh"
   },
   "devDependencies": {
     "@nestjs/common": "10.4.15",
     "@nestjs/core": "10.4.15",
     "@nestjs/microservices": "10.4.15",
+    "@types/jest": "30.0.0",
     "@types/node": "^20.14.4",
     "@typescript-eslint/eslint-plugin": "^8.49.0",
     "@typescript-eslint/parser": "^8.49.0",
     "eslint": "^9.39.1",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.4",
+    "jest": "30.5.2",
+    "nats": "^2.29.2",
     "prettier": "^3.7.4",
+    "reflect-metadata": "0.2.2",
     "rimraf": "^5.0.7",
     "rxjs": "^7.8.0",
+    "ts-jest": "29.4.14",
     "typescript": "^5.4.5"
   },
   "peerDependencies": {
-    "@nestjs/common": "*",
-    "@nestjs/core": "*",
-    "@nestjs/microservices": "*",
+    "@nestjs/common": "^10.0.0 || ^11.0.0 || ^12.0.0",
+    "@nestjs/core": "^10.0.0 || ^11.0.0 || ^12.0.0",
+    "@nestjs/microservices": "^10.0.0 || ^11.0.0 || ^12.0.0",
+    "nats": "^2.29.2",
     "reflect-metadata": "^0.1.12 || ^0.2.0",
     "rxjs": "^7.8.0"
   }

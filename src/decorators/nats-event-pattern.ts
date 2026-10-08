@@ -9,6 +9,6 @@ export const NatsEventPattern: {
 } = (metadata?: string | string[], extras?: Record<string, any>): MethodDecorator => {
   return applyDecorators(
     UseInterceptors(NatsRpcExceptionInterceptor),
-    EventPattern(Array.isArray(metadata) ? metadata.join('.') : metadata, Transport.NATS, extras),
+    EventPattern(Array.isArray(metadata) ? metadata.join('.') : metadata, Transport.NATS, extras) as MethodDecorator,
   );
 };

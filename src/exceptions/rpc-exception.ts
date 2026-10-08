@@ -33,7 +33,8 @@ export class NatsRpcException extends Error {
 
     this.message = String(source.message || 'Unknown error');
     if (source.errorCode) this.errorCode = source.errorCode as string;
-    if (source.statusCode || source.status) this.statusCode = (source.statusCode || source.status) as HttpStatus;
+    const statusCode = source.statusCode || source.status;
+    if (typeof statusCode === 'number') this.statusCode = statusCode;
     if (source.errors) this.errors = source.errors;
   }
 }

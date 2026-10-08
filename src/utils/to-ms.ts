@@ -25,7 +25,7 @@ export function toMs(n: number, unit: TimeUnitType) {
     case 'ms':
       return n * ms;
     case 'ns':
-      return n;
+      return n / 1e6;
     default:
       return undefined;
   }

@@ -1,6 +1,7 @@
-import { Logger, OnModuleDestroy } from '@nestjs/common';
+import { HttpStatus, Logger, OnModuleDestroy } from '@nestjs/common';
 import { isObject } from '@nestjs/common/utils/shared.utils';
 import {
+  BaseRpcContext,
   CustomTransportStrategy,
   IncomingRequest,
   MessageHandler,
@@ -29,8 +30,13 @@ import {
   MsgHdrs,
   MsgHdrsImpl,
   NatsError,
+  ConsumerMessages,
+  Subscription,
 } from 'nats';
 import { SimpleMutex } from 'nats/lib/nats-base-client/util';
+import { createHash } from 'crypto';
+import { EventEmitter } from 'events';
+import { Observable, ReplaySubject, distinctUntilChanged, finalize } from 'rxjs';
 import { NatsContext } from '../ctx-host/nats.context';
 import { NatsResponseSerializer } from '../serializers';
 import { NatsRequestJSONDeserializer } from '../deserializers';
@@ -41,9 +47,19 @@ import {
   NAK,
   TERM,
   NATS_CONNECTION_DRAINING_ERROR_CODE,
+  NATS_CONNECTION_CLOSED_ERROR_CODE,
+  NATS_CONSUMER_NOT_FOUND_ERROR_CODE,
   AUTHORIZATION_VIOLATION_RETRY_DELAY,
+  CONSUMER_RETRY_DELAY,
   NATS_AUTHORIZATION_VIOLATION_ERROR_CODE,
+  RECONNECT_DELAY,
+  NATS_STATUS_BY_TYPE,
+  NATS_STATUS_EVENTS,
+  GRACE_PERIOD,
 } from '../constants';
+
+type ProcessingStartHook = (transportId: Transport | symbol, context: BaseRpcContext, done: () => Promise<any>) => void;
+type ProcessingEndHook = (transportId: Transport | symbol, context: BaseRpcContext) => void;
 
 /**
  * @publicApi
@@ -55,6 +71,16 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   private natsClient: NatsConnection;
   private jetstreamClient: JetStreamClient;
   private jetstreamManager: JetStreamManager;
+  private readonly consumerMessages = new Map<string, ConsumerMessages>();
+  private readonly subscriptions: Subscription[] = [];
+  private readonly processing = new Set<Promise<unknown>>();
+  private readonly sharedRpcPatterns = new Set<string>();
+  private reconnectTimer: NodeJS.Timeout;
+  private closing = false;
+  protected _status$ = new ReplaySubject<string>(1);
+  protected onProcessingStartHook: ProcessingStartHook = (transportId, context, done) => done();
+  protected onProcessingEndHook: ProcessingEndHook;
+  private readonly statusEventEmitter = new EventEmitter();
 
   constructor(
     private readonly options: NatsServerConnectionOptions,
@@ -74,6 +100,9 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   public async listen(callback: (err?: unknown, ...optionalParams: unknown[]) => void) {
     try {
       this.natsClient = await this.createClient();
+      if (this.closing) return void this.natsClient.close();
+      this._status$.next('connected');
+      void this.natsClient.closed().then(err => err && this.reconnect(err));
       if (this.options.jetStream) {
         this.jetstreamClient = this.createJetStreamClient();
         this.jetstreamManager = await this.createJetStreamManager();
@@ -82,15 +111,14 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         }
       }
       this.handleStatusUpdates(this.natsClient);
-      await this.start(callback);
-
       this.logger.log(
         `Nats server connected to "${this.natsClient.getServer()}" server id "${this.natsClient.info.server_id}"`,
       );
+      await this.start(callback);
     } catch (err) {
-      if (err.code === NATS_AUTHORIZATION_VIOLATION_ERROR_CODE) {
-        this.logger.error(err, 'Authorization violation, retrying in 5 seconds...');
-        setTimeout(() => this.listen(callback), AUTHORIZATION_VIOLATION_RETRY_DELAY);
+      if (err.code === NATS_AUTHORIZATION_VIOLATION_ERROR_CODE && !this.closing) {
+        this.logger.error('Authorization violation, retrying in 5 seconds...', err?.stack);
+        this.reconnectTimer = setTimeout(() => this.listen(callback), AUTHORIZATION_VIOLATION_RETRY_DELAY);
       } else {
         callback(err);
       }
@@ -101,12 +129,21 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     const options = this.options.connection || ({} as ConnectionOptions);
     return connect({
       servers: NATS_DEFAULT_URL,
+      maxReconnectAttempts: -1,
       ...options,
     });
   }
 
+  private reconnect(err: unknown) {
+    if (this.closing) return;
+    this.logger.error('Nats connection closed, reconnecting in 5 seconds...', (err as Error)?.stack);
+    this.consumerMessages.forEach(messages => messages.stop());
+    void this.natsClient.close();
+    this.reconnectTimer = setTimeout(() => this.listen(e => e && this.reconnect(e)), RECONNECT_DELAY);
+  }
+
   private createJetStreamClient(): JetStreamClient {
-    return this.natsClient.jetstream();
+    return this.natsClient.jetstream(this.options.jetStreamOptions);
   }
 
   private async createJetStreamManager(): Promise<JetStreamManager> {
@@ -114,14 +151,27 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   }
 
   public async close() {
+    this.closing = true;
+    clearTimeout(this.reconnectTimer);
     if (!this.natsClient) return;
+
+    // Stops taking messages and lets the handlers in progress reply and ack
+    this.subscriptions.forEach(subscription => subscription.unsubscribe());
+    this.consumerMessages.forEach(messages => messages.stop());
+    let gracePeriod: NodeJS.Timeout;
+    await Promise.race([
+      Promise.all(this.processing),
+      new Promise(resolve => (gracePeriod = setTimeout(resolve, GRACE_PERIOD))),
+    ]);
+    clearTimeout(gracePeriod);
 
     try {
       await this.natsClient.drain();
+      if (!this.natsClient.isClosed()) await this.natsClient.close();
     } catch (error) {
       this.logger.error(
-        error,
         `Failed to drain the NATS server due to an error, forcibly closing the connection: reason=${error.code}`,
+        error?.stack,
       );
 
       await this.natsClient?.close();
@@ -130,11 +180,39 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     this.natsClient = null;
     this.jetstreamClient = null;
     this.jetstreamManager = null;
+    this.statusEventEmitter.removeAllListeners();
     this.logger.log('Nats server disconnected');
+  }
+
+  public unwrap<T>(): T {
+    if (!this.natsClient) {
+      throw new Error(
+        'Not initialized. Please call the "listen"/"startAllMicroservices" method before accessing the server.',
+      );
+    }
+    return this.natsClient as T;
+  }
+
+  public get status(): Observable<string> {
+    return this._status$.asObservable().pipe(distinctUntilChanged());
+  }
+
+  public on(event: string, callback: Function) {
+    this.statusEventEmitter.on(event, callback as (...args: unknown[]) => void);
+  }
+
+  public setOnProcessingStartHook(hook: ProcessingStartHook) {
+    this.onProcessingStartHook = hook;
+  }
+
+  public setOnProcessingEndHook(hook: ProcessingEndHook) {
+    this.onProcessingEndHook = hook;
   }
 
   public async start(callback: (err?: unknown, ...optionalParams: unknown[]) => void) {
     try {
+      const [shared] = this.sharedRpcPatterns;
+      if (shared) throw new Error(`Several handlers for the RPC pattern [${shared}]: one handler per pattern`);
       if (this.options.jetStream) {
         await this.bindJetStreamEvents();
       } else {
@@ -159,11 +237,16 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     try {
       return await this.jetstreamClient.consumers.get(stream, consumerName);
     } catch (e) {
+      if (e.api_error?.err_code !== NATS_CONSUMER_NOT_FOUND_ERROR_CODE) throw e;
       return undefined;
     }
   }
 
-  private buildConsumerOptions({
+  private buildConsumerOptions(options: ConsumerUpdateConfig) {
+    return this.pickConsumerOptions({ ...this.options.globalEventOptions, ...options });
+  }
+
+  private pickConsumerOptions({
     description,
     ack_wait,
     max_deliver,
@@ -183,14 +266,13 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     metadata,
   }: ConsumerUpdateConfig) {
     return {
-      ...(this.options.globalEventOptions || {}),
       ...(description ? { description } : {}),
       ...(ack_wait ? { ack_wait } : {}),
       ...(max_deliver ? { max_deliver } : {}),
       ...(sample_freq ? { sample_freq } : {}),
       ...(max_ack_pending ? { max_ack_pending } : {}),
       ...(max_waiting ? { max_waiting } : {}),
-      ...(headers_only ? { headers_only } : {}),
+      ...(headers_only !== undefined ? { headers_only } : {}),
       ...(max_batch ? { max_batch } : {}),
       ...(max_expires ? { max_expires } : {}),
       ...(inactive_threshold ? { inactive_threshold } : {}),
@@ -204,18 +286,21 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     };
   }
 
+  /** The hash tells apart subjects that differ only by ".", "-", "*", ">" or whitespace */
   private buildConsumerName(channel: string) {
-    return [this.options.consumerName, channel.replace(/\s|\.|>|\*/g, '-')].join(':');
+    const hash = createHash('sha256').update(channel).digest('hex').slice(0, 8);
+    return [this.options.consumerName, `${channel.replace(/\s|\.|>|\*/g, '-')}~${hash}`].join(':');
   }
 
   public bindEvents() {
     const eventHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => handler.isEventHandler);
 
     const subscribe = (channel: string, handler: MessageHandler<any, any, any>) => {
-      this.natsClient.subscribe(channel, {
+      const subscription = this.natsClient.subscribe(channel, {
         queue: this.options.consumerName,
         callback: this.getEventHandler(channel, handler).bind(this),
       });
+      this.subscriptions.push(subscription);
 
       this.logger.log(`Subscribed to [${channel}] events`);
     };
@@ -227,10 +312,11 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     const requestHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => !handler.isEventHandler);
 
     const subscribe = (channel: string, handler: MessageHandler<any, any, any>) => {
-      this.natsClient.subscribe(channel, {
+      const subscription = this.natsClient.subscribe(channel, {
         queue: channel,
         callback: this.getRequestHandler(channel, handler).bind(this),
       });
+      this.subscriptions.push(subscription);
 
       this.logger.log(`Subscribed to [${channel}] requests`);
     };
@@ -238,12 +324,23 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     requestHandlers.forEach(([channel, handler]) => subscribe(channel, handler));
   }
 
+  /** NestJS calls one handler of a pattern that has an RPC handler: the others are replaced or never run */
+  public addHandler(pattern: any, callback: MessageHandler, isEventHandler = false, extras: Record<string, any> = {}) {
+    const route = this.normalizePattern(pattern);
+    const head = this.messageHandlers.get(route);
+    if (head && !(isEventHandler && head.isEventHandler)) this.sharedRpcPatterns.add(route);
+    super.addHandler(pattern, callback, isEventHandler, extras);
+  }
+
   public async bindJetStreamEvents() {
     const eventHandlers = [...this.messageHandlers.entries()].filter(([, handler]) => handler.isEventHandler);
+    // NestJS links the handlers of one pattern with `next`, and a JetStream message has one acknowledgement
+    const [shared] = eventHandlers.find(([, handler]) => handler.next) ?? [];
+    if (shared) throw new Error(`Several handlers for the JetStream pattern [${shared}]: one handler per pattern`);
 
     const subscribe = async (channel: string, handler: MessageHandler<any, any, any>) => {
       const consumerName = this.buildConsumerName(channel);
-      const eventOptions: NatsEventHandlerOptions = handler.extras || {};
+      const eventOptions: NatsEventHandlerOptions = { ...this.options.globalEventOptions, ...handler.extras };
       const deliver_policy = eventOptions.deliver_policy || DeliverPolicy.New;
 
       const consumerOptions = this.buildConsumerOptions(eventOptions);
@@ -258,25 +355,22 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
           name: consumerName,
           durable_name: consumerName,
           deliver_group: this.options.consumerName,
-          filter_subject: channel,
+          filter_subject: eventOptions.filter_subjects?.length ? undefined : channel,
           ack_policy: AckPolicy.Explicit,
           deliver_policy,
+          opt_start_seq: eventOptions.opt_start_seq,
+          opt_start_time: eventOptions.opt_start_time,
           replay_policy: ReplayPolicy.Instant,
           ...consumerOptions,
         });
         consumer = await this.getConsumer(stream, consumerName);
       }
 
-      if (eventOptions.batch) {
-        void this.runBatchSubscription(consumer, channel, handler, eventOptions);
-        this.logger.log(`Subscribed to [${channel}] JetStream events batch`);
-      } else {
-        void this.runSubscription(consumer, channel, handler, eventOptions);
-        this.logger.log(`Subscribed to [${channel}] JetStream events`);
-      }
+      void this.runSubscription(consumer, channel, handler, eventOptions);
+      this.logger.log(`Subscribed to [${channel}] JetStream events`);
     };
 
-    eventHandlers.forEach(async ([channel, handler]) => await subscribe(channel, handler));
+    await Promise.all(eventHandlers.map(([channel, handler]) => subscribe(channel, handler)));
   }
 
   private async runSubscription(
@@ -286,11 +380,16 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     eventOptions: NatsEventHandlerOptions,
   ) {
     try {
-      const iter = await consumer.consume(eventOptions.max_messages ? { max_messages: eventOptions.max_messages } : {});
+      const iter = await consumer.consume({
+        max_messages: eventOptions.max_messages || eventOptions.max_handlers || 1,
+        abort_on_missing_resource: true,
+      });
+      this.consumerMessages.set(channel, iter);
       const mutex = new SimpleMutex(eventOptions.max_handlers || 1);
 
       for await (const message of iter) {
         await mutex.lock();
+        if (this.closing) return;
         void this.handleNatsJetStreamEvent(channel, message, handler, mutex);
       }
     } catch (err) {
@@ -299,67 +398,66 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         return;
       }
 
-      this.logger.error(err, `Consumer [${channel}] failed: reason=${err.code}`);
+      this.logger.error(`Consumer [${channel}] failed: reason=${err.code}`, err?.stack);
+      if (err instanceof NatsError && err.code === NATS_CONNECTION_CLOSED_ERROR_CODE) return;
+      await new Promise(resolve => setTimeout(resolve, CONSUMER_RETRY_DELAY));
     }
 
-    if (this.jetstreamClient) {
+    if (this.jetstreamClient && !this.closing) {
       void this.runSubscription(consumer, channel, handler, eventOptions);
     }
   }
 
-  private async runBatchSubscription(
-    consumer: Consumer,
-    channel: string,
-    handler: MessageHandler<any, any, any>,
-    eventOptions: NatsEventHandlerOptions,
-  ) {
-    const mutex = new SimpleMutex(1);
-    try {
-      await mutex.lock();
-      const expires = eventOptions.batch_expires || 1000;
-      const iter = await consumer.fetch({
-        expires,
-        ...(eventOptions.max_messages ? { max_messages: eventOptions.max_messages } : {}),
-      });
-
-      const batch: any[] = [];
-      for await (const message of iter) {
-        batch.push(message);
-      }
-      if (batch.length > 0) {
-        await this.handleNatsJetStreamBatchEvents(channel, batch, handler, mutex);
-        await mutex.lock();
-      }
-    } catch (err) {
-      if (err instanceof NatsError && err.code === NATS_CONNECTION_DRAINING_ERROR_CODE) {
-        this.logger.log(`Stopping messages batch consuming due server is draining: channel=${channel}`);
-        return;
-      }
-
-      this.logger.error(err, `Batch consumer [${channel}] failed`);
-    }
-
-    if (this.jetstreamClient) {
-      void this.runBatchSubscription(consumer, channel, handler, eventOptions);
-    }
-  }
-
   private getEventHandler(channel: string, handler: MessageHandler<any, any, any>) {
-    return async (error: object | undefined, message: Msg) => {
+    return async (error: NatsError | undefined, message: Msg) => {
       if (error) {
-        return this.logger.error(error);
+        return this.logger.error(error.message, error.stack);
       }
       return this.handleNatsEvent(channel, message, handler);
     };
   }
 
   private getRequestHandler(channel: string, handler: MessageHandler<any, any, any>) {
-    return async (error: object | undefined, message: Msg) => {
+    return async (error: NatsError | undefined, message: Msg) => {
       if (error) {
-        return this.logger.error(error);
+        return this.logger.error(error.message, error.stack);
       }
-      return this.handleRequest(channel, message, handler);
+      return this.handleNatsRequest(channel, message, handler).catch(err => {
+        this.logger.error(`Failed to process request [${channel}]`, err?.stack);
+        return this.respondWithError(message, {
+          message: `Bad Request: ${err?.message}`,
+          statusCode: HttpStatus.BAD_REQUEST,
+        });
+      });
     };
+  }
+
+  /** Runs the handler and subscribes to its result inside the processing hooks, as the base Server of NestJS 12 */
+  private sendWithHooks(
+    context: NatsContext,
+    produce: () => Promise<Observable<any>>,
+    respond: (response: WritePacket<any>) => Promise<unknown>,
+  ): Promise<void> {
+    const end = () => this.onProcessingEndHook?.(this.transportId, context);
+    let processed: () => void;
+    const processing = new Promise<void>(resolve => (processed = resolve)).then(() =>
+      this.processing.delete(processing),
+    );
+    this.processing.add(processing);
+    return new Promise((resolve, reject) =>
+      this.onProcessingStartHook(this.transportId, context, async () => {
+        try {
+          this.send((await produce()).pipe(finalize(end)), packet =>
+            respond(packet).finally(() => packet.isDisposed && processed()),
+          );
+          resolve();
+        } catch (err) {
+          end();
+          processed();
+          reject(err);
+        }
+      }),
+    );
   }
 
   public async handleNatsEvent(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
@@ -371,15 +469,15 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         headers: natsMsg.headers,
       });
 
-      const response$ = this.transformToObservable(await handler(message.data || message, natsCtx));
+      const produce = async () => this.transformToObservable(await handler(message.data, natsCtx));
 
       const respond = async (response: WritePacket<any>) => {
         return;
       };
 
-      this.send(response$, respond);
+      await this.sendWithHooks(natsCtx, produce, respond);
     } catch (err) {
-      this.logger.error(err, 'Incorrect event data');
+      this.logger.error('Incorrect event data', err?.stack);
     }
   }
 
@@ -389,7 +487,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     handler: MessageHandler<any, any, any>,
     mutex: SimpleMutex,
   ) {
-    const eventOptions: NatsEventHandlerOptions = handler.extras || {};
+    const eventOptions: NatsEventHandlerOptions = { ...this.options.globalEventOptions, ...handler.extras };
     try {
       natsMsg.working();
 
@@ -399,7 +497,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         headers: natsMsg.headers,
       });
 
-      const response$ = this.transformToObservable(await handler(message.data || message, natsCtx));
+      const produce = async () => this.transformToObservable(await handler(message.data, natsCtx));
 
       const respond = async (response: WritePacket<any>) => {
         try {
@@ -411,86 +509,19 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
             natsMsg.ack();
           }
         } catch (e) {
-          this.logger.error(e);
+          this.logger.error(e?.message, e?.stack);
         } finally {
           mutex.unlock();
         }
       };
 
-      this.send(response$, respond);
+      await this.sendWithHooks(natsCtx, produce, respond);
     } catch (err) {
-      this.logger.error(err, 'Failed to process event data');
+      this.logger.error('Failed to process event data', err?.stack);
       try {
         natsMsg.term('Failed to process event data');
       } catch (e) {
-        this.logger.error(e, 'Failed to term failed nats msg');
-      }
-      mutex.unlock();
-    }
-  }
-
-  public async handleNatsJetStreamBatchEvents(
-    channel: string,
-    batchMsgs: JsMsg[],
-    handler: MessageHandler<any, any, any>,
-    mutex: SimpleMutex,
-  ) {
-    const eventOptions: NatsEventHandlerOptions = handler.extras || {};
-    try {
-      const validNatsMsgs: JsMsg[] = [];
-      const messages: any[] = [];
-
-      await Promise.all(
-        batchMsgs.map(async natsMsg => {
-          natsMsg.working();
-          try {
-            const message = await this.deserializer.deserialize(natsMsg.data, {
-              channel,
-              headers: natsMsg.headers,
-            });
-            if (!message) throw new Error('Empty message');
-
-            validNatsMsgs.push(natsMsg);
-            messages.push(message.data || message);
-          } catch (e) {
-            natsMsg.term(e.message);
-          }
-        }),
-      );
-
-      if (!messages.length) {
-        mutex.unlock();
-        return;
-      }
-
-      const natsCtx = new NatsContext([validNatsMsgs[0]]);
-      const response$ = this.transformToObservable(await handler(messages, natsCtx));
-
-      const respond = async (response: WritePacket<any>) => {
-        try {
-          if (response.err || response.response === NAK) {
-            batchMsgs.forEach(natsMsg => natsMsg.nak(this.calculateNakDelay(natsMsg, eventOptions)));
-          } else if (response.response === TERM) {
-            batchMsgs.forEach(natsMsg => natsMsg.term());
-          } else {
-            batchMsgs.forEach(natsMsg => natsMsg.ack());
-          }
-        } catch (e) {
-          this.logger.error(e);
-        } finally {
-          mutex.unlock();
-        }
-      };
-
-      this.send(response$, respond);
-    } catch (err) {
-      this.logger.error(err, 'Failed to process batch event data');
-      try {
-        batchMsgs.forEach(async natsMsg => {
-          natsMsg.nak(this.calculateNakDelay(natsMsg, eventOptions));
-        });
-      } catch (e) {
-        this.logger.error(e);
+        this.logger.error('Failed to term failed nats msg', e?.stack);
       }
       mutex.unlock();
     }
@@ -517,7 +548,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     }
   }
 
-  public async handleRequest(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
+  public async handleNatsRequest(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
     const replyTo = natsMsg.reply;
 
     const natsCtx = new NatsContext([natsMsg]);
@@ -527,7 +558,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       headers: natsMsg.headers,
     })) as IncomingRequest;
 
-    const response$ = this.transformToObservable(await handler(incomingMessage.data || incomingMessage, natsCtx));
+    const produce = async () => this.transformToObservable(await handler(incomingMessage.data, natsCtx));
     const respond = async (response: WritePacket<any>) => {
       response = this.preparePacketHeaders(response);
       const message: NatsRecord = await this.serializer.serialize({ id: incomingMessage.id, ...response }, {});
@@ -536,7 +567,24 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       });
     };
 
-    this.send(response$, respond);
+    await this.sendWithHooks(natsCtx, produce, response =>
+      respond(response).catch(err => {
+        this.logger.error(`Failed to send response [${channel}]`, err?.stack);
+        return this.respondWithError(natsMsg, {
+          message: `Internal Server Error: ${err?.message}`,
+          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+        });
+      }),
+    );
+  }
+
+  private async respondWithError(natsMsg: Msg, err: { message: string; statusCode: HttpStatus }) {
+    try {
+      const message: NatsRecord = await this.serializer.serialize({ id: undefined, err, isDisposed: true }, {});
+      natsMsg.respond(message.data);
+    } catch (e) {
+      this.logger.error(`Failed to send error response [${natsMsg.subject}]`, e?.stack);
+    }
   }
 
   private preparePacketHeaders(packet: WritePacket<any>): WritePacket {
@@ -576,6 +624,8 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   public async handleStatusUpdates(client: NatsConnection) {
     for await (const status of client.status()) {
       const data = status.data && isObject(status.data) ? JSON.stringify(status.data) : status.data;
+      if (NATS_STATUS_BY_TYPE[status.type]) this._status$.next(NATS_STATUS_BY_TYPE[status.type]);
+      if (NATS_STATUS_EVENTS.includes(status.type)) this.statusEventEmitter.emit(status.type, status.data);
 
       switch (status.type) {
         case 'error':

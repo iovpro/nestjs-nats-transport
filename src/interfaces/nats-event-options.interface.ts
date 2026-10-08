@@ -1,4 +1,4 @@
-import { ConsumerUpdateConfig, DeliverPolicy } from 'nats';
+import { ConsumerConfig, ConsumerUpdateConfig, DeliverPolicy } from 'nats';
 
 export enum NakStrategy {
   increment = 'increment',
@@ -6,10 +6,11 @@ export enum NakStrategy {
   fibonacci = 'fibonacci',
 }
 
-export interface NatsEventHandlerOptions extends ConsumerUpdateConfig {
+export interface NatsEventHandlerOptions
+  extends ConsumerUpdateConfig, Pick<ConsumerConfig, 'opt_start_seq' | 'opt_start_time'> {
   /*** Default: New */
   deliver_policy?: DeliverPolicy;
-  /*** Default: 100 */
+  /*** Default: max_handlers */
   max_messages?: number;
   /*** Default: 1000 (1s) */
   nak_delay?: number;
@@ -19,10 +20,4 @@ export interface NatsEventHandlerOptions extends ConsumerUpdateConfig {
   nak_strategy?: NakStrategy;
   /*** Default: 1 */
   max_handlers?: number;
-  /**  Use batch consumer (only for JetStream)
-   ** Default: false */
-  batch?: boolean;
-  /** Actual only for batch = true.
-   **  Default: 1000 (1s) */
-  batch_expires?: number;
 }

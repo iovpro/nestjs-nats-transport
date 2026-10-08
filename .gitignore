@@ -37,3 +37,6 @@ lerna-debug.log*
 
 # AI
 CLAUDE.md
+
+# E2E scenarios build
+/test/.build

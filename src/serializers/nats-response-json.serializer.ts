@@ -1,12 +1,10 @@
 import { isObject } from '@nestjs/common/utils/shared.utils';
-import { NatsCodec } from '@nestjs/microservices/external/nats-client.interface';
-import { WritePacket } from '@nestjs/microservices/interfaces';
+import { NatsRecord, NatsRecordBuilder, WritePacket } from '@nestjs/microservices';
 import { Serializer } from '@nestjs/microservices/interfaces/serializer.interface';
-import { NatsRecord, NatsRecordBuilder } from '@nestjs/microservices/record-builders';
-import { JSONCodec } from 'nats';
+import { Codec, JSONCodec } from 'nats';
 
 export class NatsResponseSerializer implements Serializer<WritePacket, NatsRecord> {
-  private readonly jsonCodec: NatsCodec<unknown>;
+  private readonly jsonCodec: Codec<unknown>;
 
   constructor() {
     this.jsonCodec = JSONCodec();

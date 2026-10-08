@@ -1,4 +1,4 @@
-import { BaseRpcContext } from '@nestjs/microservices/ctx-host';
+import { BaseRpcContext } from '@nestjs/microservices';
 import { JsMsg, Msg, MsgHdrs } from 'nats';
 
 type NatsContextArgs = [JsMsg | Msg];

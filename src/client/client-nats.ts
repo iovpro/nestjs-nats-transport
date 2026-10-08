@@ -1,6 +1,6 @@
 import { Logger } from '@nestjs/common/services/logger.service';
+import { OnModuleDestroy } from '@nestjs/common';
 import { isObject } from '@nestjs/common/utils/shared.utils';
-import { OnModuleDestroy } from '@nestjs/common/interfaces/hooks';
 import { NATS_DEFAULT_URL } from '@nestjs/microservices/constants';
 import { ClientProxy, NatsRecord, NatsRecordBuilder, ReadPacket, WritePacket } from '@nestjs/microservices';
 import {
@@ -15,8 +15,10 @@ import {
 import { NatsClientConnectionOptions } from '../interfaces';
 import { NatsRequestSerializer } from '../serializers';
 import { NatsResponseJSONDeserializer } from '../deserializers';
-import { firstValueFrom } from 'rxjs';
+import { Observable, ReplaySubject, distinctUntilChanged, firstValueFrom } from 'rxjs';
+import { EventEmitter } from 'events';
 import { NatsRpcException } from '../exceptions/rpc-exception';
+import { NATS_STATUS_BY_TYPE, NATS_STATUS_EVENTS } from '../constants';
 
 /**
  * @publicApi
@@ -27,11 +29,14 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
 
   protected natsClient: NatsConnection;
   protected jetstreamClient: JetStreamClient;
+  private connectionPromise: Promise<NatsConnection>;
+  protected _status$ = new ReplaySubject<string>(1);
+  private readonly statusEventEmitter = new EventEmitter();
 
   constructor(protected readonly options: NatsClientConnectionOptions) {
     super();
     this.logger = new Logger(this.constructor.name);
-    this.timeout = options.connection.timeout || 30000;
+    this.timeout = options.requestTimeout || 30000;
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
@@ -42,10 +47,11 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
 
     try {
       await this.natsClient.drain();
+      if (!this.natsClient.isClosed()) await this.natsClient.close();
     } catch (error) {
       this.logger.error(
-        error,
         `Failed to drain the NATS client due to an error, forcibly closing the connection: reason=${error.code}`,
+        error?.stack,
       );
 
       await this.natsClient?.close();
@@ -53,6 +59,7 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
 
     this.natsClient = undefined;
     this.jetstreamClient = undefined;
+    this.statusEventEmitter.removeAllListeners();
     this.logger.log('Nats client disconnected');
   }
 
@@ -61,10 +68,16 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
   }
 
   public async connect(): Promise<any> {
-    if (this.natsClient) {
+    if (this.natsClient && !this.natsClient.isClosed()) {
       return this.natsClient;
     }
+    this.connectionPromise ??= this.openConnection().finally(() => (this.connectionPromise = undefined));
+    return this.connectionPromise;
+  }
+
+  private async openConnection(): Promise<NatsConnection> {
     this.natsClient = await this.createClient();
+    this._status$.next('connected');
     if (this.options.jetStream) {
       this.jetstreamClient = this.createJetStreamClient();
     }
@@ -81,6 +94,7 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
     const options = this.options.connection || ({} as ConnectionOptions);
     return connect({
       servers: NATS_DEFAULT_URL,
+      maxReconnectAttempts: -1,
       ...options,
     });
   }
@@ -97,9 +111,26 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
     return this.jetstreamClient;
   }
 
+  public unwrap<T>(): T {
+    if (!this.natsClient) {
+      throw new Error('Not initialized. Please call the "connect" method first.');
+    }
+    return this.natsClient as T;
+  }
+
+  public get status(): Observable<string> {
+    return this._status$.asObservable().pipe(distinctUntilChanged());
+  }
+
+  public on(event: string, callback: Function) {
+    this.statusEventEmitter.on(event, callback as (...args: unknown[]) => void);
+  }
+
   public async handleStatusUpdates(client: NatsConnection) {
     for await (const status of client.status()) {
       const data = status.data && isObject(status.data) ? JSON.stringify(status.data) : status.data;
+      if (NATS_STATUS_BY_TYPE[status.type]) this._status$.next(NATS_STATUS_BY_TYPE[status.type]);
+      if (NATS_STATUS_EVENTS.includes(status.type)) this.statusEventEmitter.emit(status.type, status.data);
 
       switch (status.type) {
         case 'error':

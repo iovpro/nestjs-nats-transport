@@ -28,7 +28,7 @@ export class NatsRpcExceptionInterceptor implements NestInterceptor {
     const statusCode: HttpStatus = err?.statusCode || err?.status;
 
     if (!statusCode || (statusCode >= 500 && statusCode < 600)) {
-      logger.error(err);
+      logger.error(err?.message ?? err, err?.stack);
     } else {
       logger.debug(err);
     }

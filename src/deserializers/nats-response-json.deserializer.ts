@@ -1,20 +1,18 @@
-import { NatsCodec } from '@nestjs/microservices/external/nats-client.interface';
-import { IncomingResponse } from '@nestjs/microservices/interfaces';
-import { IncomingResponseDeserializer } from '@nestjs/microservices/deserializers';
-import { JSONCodec } from 'nats';
+import { IncomingResponseDeserializer } from '@nestjs/microservices/deserializers/incoming-response.deserializer';
+import { Codec, JSONCodec } from 'nats';
 
 /**
  * @publicApi
  */
 export class NatsResponseJSONDeserializer extends IncomingResponseDeserializer {
-  private readonly jsonCodec: NatsCodec<unknown>;
+  private readonly jsonCodec: Codec<unknown>;
 
   constructor() {
     super();
     this.jsonCodec = JSONCodec();
   }
 
-  deserialize(value: Uint8Array, options?: Record<string, any>): IncomingResponse {
+  deserialize(value: Uint8Array, options?: Record<string, any>) {
     const decodedRequest = this.jsonCodec.decode(value);
     return super.deserialize(decodedRequest, options);
   }

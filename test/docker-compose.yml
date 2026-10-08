@@ -1,0 +1,40 @@
+version: '3.8'
+
+# NATS servers for the e2e suite (yarn test:e2e).
+# Non-default ports avoid clashing with a local NATS on 4222.
+services:
+  # Current NATS: JetStream API is strict by default since 2.12 (unknown JSON fields are rejected)
+  nats-main:
+    image: nats:2.15.0
+    container_name: nats-transport-test-main
+    command: ['-js', '-m', '8222']
+    ports:
+      - '127.0.0.1:14222:4222'
+      - '127.0.0.1:18222:8222'
+
+  # Legacy NATS without the strict JetStream API
+  nats-legacy:
+    image: nats:2.10.29
+    container_name: nats-transport-test-legacy
+    command: ['-js', '-m', '8222']
+    ports:
+      - '127.0.0.1:14225:4222'
+      - '127.0.0.1:18225:8222'
+
+  # Stopped and started by the connection-loss scenarios
+  nats-outage:
+    image: nats:2.15.0
+    container_name: nats-transport-test-outage
+    command: ['-js']
+    ports:
+      - '127.0.0.1:14223:4222'
+
+  # Requires user/password (nats-auth.conf); scenarios connect with wrong credentials or as a user that may not pull
+  nats-auth:
+    image: nats:2.15.0
+    container_name: nats-transport-test-auth
+    command: ['-c', '/etc/nats/auth.conf']
+    volumes:
+      - ./nats-auth.conf:/etc/nats/auth.conf:ro
+    ports:
+      - '127.0.0.1:14224:4222'
