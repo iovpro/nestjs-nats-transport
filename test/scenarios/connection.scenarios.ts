@@ -1,10 +1,12 @@
 import { Controller } from '@nestjs/common';
 import { execFileSync } from 'child_process';
-import { JSONCodec, connect } from 'nats';
+import { JSONCodec, NatsConnection, connect } from 'nats';
 import { ClientNats, NatsEventPattern, ServerNats } from '../../src';
-import { NATS_AUTH_URL, NATS_OUTAGE_CONTAINER, NATS_OUTAGE_URL } from './env';
+import { NATS_AUTH_URL, NATS_MAIN_URL, NATS_OUTAGE_CONTAINER, NATS_OUTAGE_URL } from './env';
 import {
   CountingLogger,
+  STREAM,
+  consumerInfoFor,
   createService,
   log,
   marker,
@@ -251,5 +253,38 @@ export const scenarios: Record<string, () => Promise<void>> = {
     report({ statuses, events, rpc });
     await client.close();
     await app.close();
+  },
+
+  async 'con-12-consumer-deleted-storm'() {
+    await resetStream(NATS_MAIN_URL);
+    const logger = new CountingLogger({ quiet: true, filter: /Consumer.*failed/ });
+    const app = await startService([OutageRegularController], { jetStream: true }, streams(), logger);
+    await sleep(1000);
+
+    const nc = await connect({ servers: NATS_MAIN_URL });
+    const jsm = await nc.jetstreamManager();
+    const consumer = await consumerInfoFor(jsm, 'e2e.js.outage.regular');
+    await jsm.consumers.delete(STREAM, consumer!.name);
+    await nc.close();
+    log('consumer deleted');
+
+    await sleep(3000);
+    await app.close();
+    report({ errorLogs: logger.matched });
+  },
+
+  async 'con-13-close-during-outage'() {
+    const server = new ServerNats({ consumerName: 'e2e', connection: { servers: NATS_OUTAGE_URL } });
+    const app = await startStrategy(server, [RpcController]);
+    const nc = server.unwrap<NatsConnection>();
+    await sleep(1000);
+
+    docker('stop', '-t', '0', NATS_OUTAGE_CONTAINER);
+    await sleep(2000);
+
+    const startedAt = Date.now();
+    await app.close();
+    // main.ts ends the process after the scenario: the connection itself must be closed
+    report({ closed: nc.isClosed(), closeMs: Date.now() - startedAt });
   },
 };

@@ -72,6 +72,23 @@ describe('Connection lifecycle', () => {
     expect(run.result).toEqual({ before: 'ok', after: 'ok' });
   });
 
+  it('CON-12 a deleted consumer should cause a few retries per second, not a pull storm', async () => {
+    const run = await runScenario('con-12-consumer-deleted-storm', 20_000);
+
+    expect(processOutcome(run)).toEqual(HEALTHY);
+    expect(run.result.errorLogs).toBeGreaterThanOrEqual(1);
+    expect(run.result.errorLogs).toBeLessThanOrEqual(10);
+  });
+
+  it('CON-13 close() should close the connection at once while NATS is down', async () => {
+    const run = await runScenario('con-13-close-during-outage', 20_000);
+
+    expect(processOutcome(run)).toEqual(HEALTHY);
+    expect(run.result.closed).toBe(true);
+    // No drain: it would wait for the next reconnect attempt (2 s by default)
+    expect(run.result.closeMs).toBeLessThan(1000);
+  });
+
   it('CON-11 status and on() should report the outage and the recovery (server and client)', async () => {
     const run = await runScenario('con-11-status-and-events', 40_000);
 

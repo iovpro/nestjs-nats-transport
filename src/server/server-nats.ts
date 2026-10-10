@@ -1,5 +1,5 @@
 import { HttpStatus, Logger, OnModuleDestroy } from '@nestjs/common';
-import { isObject } from '@nestjs/common/utils/shared.utils';
+import { isNil } from '@nestjs/common/utils/shared.utils';
 import {
   BaseRpcContext,
   CustomTransportStrategy,
@@ -36,7 +36,9 @@ import {
 import { SimpleMutex } from 'nats/lib/nats-base-client/util';
 import { createHash } from 'crypto';
 import { EventEmitter } from 'events';
+import { STATUS_CODES } from 'http';
 import { Observable, ReplaySubject, distinctUntilChanged, finalize } from 'rxjs';
+import { addStatusListener, closeConnection, stackOf, watchStatus } from '../connection/nats-connection';
 import { NatsContext } from '../ctx-host/nats.context';
 import { NatsResponseSerializer } from '../serializers';
 import { NatsRequestJSONDeserializer } from '../deserializers';
@@ -53,19 +55,32 @@ import {
   CONSUMER_RETRY_DELAY,
   NATS_AUTHORIZATION_VIOLATION_ERROR_CODE,
   RECONNECT_DELAY,
-  NATS_STATUS_BY_TYPE,
-  NATS_STATUS_EVENTS,
   GRACE_PERIOD,
 } from '../constants';
 
 type ProcessingStartHook = (transportId: Transport | symbol, context: BaseRpcContext, done: () => Promise<any>) => void;
 type ProcessingEndHook = (transportId: Transport | symbol, context: BaseRpcContext) => void;
+/**
+ * A listen() with its retries and reconnects until close(): what a closed session still runs leaves the next alone.
+ * `complete` calls the listen() back, `closed` is the close of the session.
+ */
+type Session = { closing: boolean; complete?: (err?: unknown) => void; closed?: Promise<void> };
+
+/** The error of a listen() that close() has stopped, also of a listen() after a close() that came first */
+const closedBeforeListen = () => new Error('ServerNats was closed before listen() completed');
+
+/** An error reply of the library: the reason phrase of the status code and the message of the error */
+const errorReply = (statusCode: HttpStatus, err: Error) => ({
+  message: `${STATUS_CODES[statusCode]}: ${err?.message}`,
+  statusCode,
+});
 
 /**
  * @publicApi
  */
 export class ServerNats extends Server implements CustomTransportStrategy, OnModuleDestroy {
   public readonly transportId = Transport.NATS;
+  public readonly propagatesEventHandlerErrors = true;
   protected readonly logger: Logger;
 
   private natsClient: NatsConnection;
@@ -76,7 +91,9 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   private readonly processing = new Set<Promise<unknown>>();
   private readonly sharedRpcPatterns = new Set<string>();
   private reconnectTimer: NodeJS.Timeout;
-  private closing = false;
+  private session: Session = { closing: false };
+  /** NATS answers: the last status is `connected` */
+  private reachable = false;
   protected _status$ = new ReplaySubject<string>(1);
   protected onProcessingStartHook: ProcessingStartHook = (transportId, context, done) => done();
   protected onProcessingEndHook: ProcessingEndHook;
@@ -91,6 +108,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
+    this._status$.subscribe(status => (this.reachable = status === 'connected'));
   }
 
   public async onModuleDestroy() {
@@ -98,11 +116,28 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   }
 
   public async listen(callback: (err?: unknown, ...optionalParams: unknown[]) => void) {
+    // NestJS calls listen() after the init hooks of the application: app.close() during them has closed the server
+    if (this.session.closing && !this.session.complete) return callback(closedBeforeListen());
+    // Another listen() first closes what the previous one runs, also when the previous one has failed
+    if (this.session.complete) await this.stop(this.session);
+    let completed = false;
+    const complete: typeof callback = (...args) => {
+      if (completed) return;
+      callback(...args);
+      completed = true; // not before: an error the callback throws completes listen() with that error
+    };
+    this.session = { closing: false, complete };
+    await this.connect(this.session, complete);
+  }
+
+  /** Connects and starts the handlers of the session; the authorization retries and the reconnects call it again */
+  private async connect(session: Session, callback: (err?: unknown) => void) {
     try {
-      this.natsClient = await this.createClient();
-      if (this.closing) return void this.natsClient.close();
+      const natsClient = await this.createClient();
+      if (session.closing) return void natsClient.close(); // close() has completed listen()
+      this.natsClient = natsClient;
       this._status$.next('connected');
-      void this.natsClient.closed().then(err => err && this.reconnect(err));
+      void natsClient.closed().then(err => err && this.reconnect(session, err));
       if (this.options.jetStream) {
         this.jetstreamClient = this.createJetStreamClient();
         this.jetstreamManager = await this.createJetStreamManager();
@@ -110,15 +145,13 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
           await this.setupStreams();
         }
       }
-      this.handleStatusUpdates(this.natsClient);
-      this.logger.log(
-        `Nats server connected to "${this.natsClient.getServer()}" server id "${this.natsClient.info.server_id}"`,
-      );
+      this.handleStatusUpdates(natsClient);
+      this.logger.log(`Nats server connected to "${natsClient.getServer()}" server id "${natsClient.info.server_id}"`);
       await this.start(callback);
     } catch (err) {
-      if (err.code === NATS_AUTHORIZATION_VIOLATION_ERROR_CODE && !this.closing) {
+      if (err.code === NATS_AUTHORIZATION_VIOLATION_ERROR_CODE && !session.closing) {
         this.logger.error('Authorization violation, retrying in 5 seconds...', err?.stack);
-        this.reconnectTimer = setTimeout(() => this.listen(callback), AUTHORIZATION_VIOLATION_RETRY_DELAY);
+        this.schedule(() => this.connect(session, callback), AUTHORIZATION_VIOLATION_RETRY_DELAY);
       } else {
         callback(err);
       }
@@ -134,12 +167,32 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     });
   }
 
-  private reconnect(err: unknown) {
-    if (this.closing) return;
+  private reconnect(session: Session, err: unknown) {
+    // A failure that a scheduled attempt already replaces is reported twice: by closed() and by the setup
+    if (session.closing || this.reconnectTimer) return;
+    this._status$.next('reconnecting');
     this.logger.error('Nats connection closed, reconnecting in 5 seconds...', (err as Error)?.stack);
     this.consumerMessages.forEach(messages => messages.stop());
-    void this.natsClient.close();
-    this.reconnectTimer = setTimeout(() => this.listen(e => e && this.reconnect(e)), RECONNECT_DELAY);
+    void this.natsClient?.close();
+    this.release();
+    this.schedule(() => this.connect(session, e => e && this.reconnect(session, e)), RECONNECT_DELAY);
+  }
+
+  /** Schedules the next attempt to connect; close() cancels it */
+  private schedule(attempt: () => void, delay: number) {
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      attempt();
+    }, delay);
+  }
+
+  /** Forgets the connection and what is bound to it */
+  private release() {
+    this.natsClient = null;
+    this.jetstreamClient = null;
+    this.jetstreamManager = null;
+    this.subscriptions.length = 0;
+    this.consumerMessages.clear();
   }
 
   private createJetStreamClient(): JetStreamClient {
@@ -151,37 +204,45 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   }
 
   public async close() {
-    this.closing = true;
+    await this.stop(this.session);
+    this.statusEventEmitter.removeAllListeners();
+  }
+
+  /** Closes what a listen() runs; close() called again, also while the close runs, waits for the same close */
+  private stop(session: Session) {
+    return (session.closed ??= this.shutdown(session));
+  }
+
+  private async shutdown(session: Session) {
+    session.closing = true;
     clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    session.complete?.(closedBeforeListen()); // a listen() that has completed is not called back again
     if (!this.natsClient) return;
 
-    // Stops taking messages and lets the handlers in progress reply and ack
-    this.subscriptions.forEach(subscription => subscription.unsubscribe());
+    // Stops taking messages: a subscription drains the messages that NATS has routed to it. While NATS is
+    // unreachable nothing arrives, and a drain would wait for the next reconnect attempt.
+    const reachable = this.reachable;
+    const stopped = this.subscriptions.map(s => (reachable ? s.drain().catch(() => undefined) : s.unsubscribe()));
     this.consumerMessages.forEach(messages => messages.stop());
+    // Lets the handlers in progress reply and ack, for at most GRACE_PERIOD
     let gracePeriod: NodeJS.Timeout;
     await Promise.race([
-      Promise.all(this.processing),
+      Promise.all(stopped).then(() => this.idle()),
       new Promise(resolve => (gracePeriod = setTimeout(resolve, GRACE_PERIOD))),
+      this.natsClient.closed(), // nats.js has closed the connection: no reply can be sent any more
     ]);
     clearTimeout(gracePeriod);
+    this.processing.clear(); // what has not finished by now is abandoned with the connection
 
-    try {
-      await this.natsClient.drain();
-      if (!this.natsClient.isClosed()) await this.natsClient.close();
-    } catch (error) {
-      this.logger.error(
-        `Failed to drain the NATS server due to an error, forcibly closing the connection: reason=${error.code}`,
-        error?.stack,
-      );
-
-      await this.natsClient?.close();
-    }
-
-    this.natsClient = null;
-    this.jetstreamClient = null;
-    this.jetstreamManager = null;
-    this.statusEventEmitter.removeAllListeners();
+    await closeConnection(this.natsClient, this.logger, 'server', this.reachable);
+    this.release();
     this.logger.log('Nats server disconnected');
+  }
+
+  /** Resolves once no message is in processing, also the messages that arrive meanwhile */
+  private async idle() {
+    while (this.processing.size) await Promise.all(this.processing);
   }
 
   public unwrap<T>(): T {
@@ -198,7 +259,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
   }
 
   public on(event: string, callback: Function) {
-    this.statusEventEmitter.on(event, callback as (...args: unknown[]) => void);
+    addStatusListener(this.statusEventEmitter, this.logger, event, callback);
   }
 
   public setOnProcessingStartHook(hook: ProcessingStartHook) {
@@ -218,7 +279,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       } else {
         this.bindEvents();
       }
-      this.bindRequests();
+      if (!this.session.closing) this.bindRequests(); // close() has come during the JetStream setup
       callback();
     } catch (err) {
       callback(err);
@@ -242,8 +303,10 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     }
   }
 
-  private buildConsumerOptions(options: ConsumerUpdateConfig) {
-    return this.pickConsumerOptions({ ...this.options.globalEventOptions, ...options });
+  /** The decorator options over globalEventOptions; a decorator option set to undefined or null keeps the global value */
+  private buildEventOptions({ extras }: MessageHandler): NatsEventHandlerOptions {
+    const defined = Object.entries(extras ?? {}).filter(([, value]) => !isNil(value));
+    return { ...this.options.globalEventOptions, ...Object.fromEntries(defined) };
   }
 
   private pickConsumerOptions({
@@ -340,10 +403,10 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
 
     const subscribe = async (channel: string, handler: MessageHandler<any, any, any>) => {
       const consumerName = this.buildConsumerName(channel);
-      const eventOptions: NatsEventHandlerOptions = { ...this.options.globalEventOptions, ...handler.extras };
+      const eventOptions = this.buildEventOptions(handler);
       const deliver_policy = eventOptions.deliver_policy || DeliverPolicy.New;
 
-      const consumerOptions = this.buildConsumerOptions(eventOptions);
+      const consumerOptions = this.pickConsumerOptions(eventOptions);
 
       const stream = await this.getStream(channel);
       let consumer = await this.getConsumer(stream, consumerName);
@@ -366,6 +429,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
         consumer = await this.getConsumer(stream, consumerName);
       }
 
+      if (this.session.closing) return; // close() has come while the consumer was set up
       void this.runSubscription(consumer, channel, handler, eventOptions);
       this.logger.log(`Subscribed to [${channel}] JetStream events`);
     };
@@ -378,6 +442,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     channel: string,
     handler: MessageHandler<any, any, any>,
     eventOptions: NatsEventHandlerOptions,
+    session = this.session,
   ) {
     try {
       const iter = await consumer.consume({
@@ -389,8 +454,8 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
 
       for await (const message of iter) {
         await mutex.lock();
-        if (this.closing) return;
-        void this.handleNatsJetStreamEvent(channel, message, handler, mutex);
+        if (session.closing) return;
+        void this.track(this.handleNatsJetStreamEvent(channel, message, handler, mutex, eventOptions));
       }
     } catch (err) {
       if (err instanceof NatsError && err.code === NATS_CONNECTION_DRAINING_ERROR_CODE) {
@@ -403,8 +468,8 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       await new Promise(resolve => setTimeout(resolve, CONSUMER_RETRY_DELAY));
     }
 
-    if (this.jetstreamClient && !this.closing) {
-      void this.runSubscription(consumer, channel, handler, eventOptions);
+    if (this.jetstreamClient && !session.closing) {
+      void this.runSubscription(consumer, channel, handler, eventOptions, session);
     }
   }
 
@@ -413,7 +478,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       if (error) {
         return this.logger.error(error.message, error.stack);
       }
-      return this.handleNatsEvent(channel, message, handler);
+      return this.track(this.handleNatsEvent(channel, message, handler));
     };
   }
 
@@ -422,14 +487,21 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       if (error) {
         return this.logger.error(error.message, error.stack);
       }
-      return this.handleNatsRequest(channel, message, handler).catch(err => {
-        this.logger.error(`Failed to process request [${channel}]`, err?.stack);
-        return this.respondWithError(message, {
-          message: `Bad Request: ${err?.message}`,
-          statusCode: HttpStatus.BAD_REQUEST,
-        });
-      });
+      // Only a request that cannot be deserialized gets here: sendWithHooks() replies to the other failures
+      return this.track(
+        this.handleNatsRequest(channel, message, handler).catch(err => {
+          this.logger.error(`Failed to process request [${channel}]`, err?.stack);
+          return this.respondWithError(message, errorReply(HttpStatus.BAD_REQUEST, err));
+        }),
+      );
     };
+  }
+
+  /** Counts a message as in processing from its arrival, before its deserialization, for close() to wait for it */
+  private track<T>(work: Promise<T>) {
+    const tracked: Promise<unknown> = work.catch(() => undefined).then(() => this.processing.delete(tracked));
+    this.processing.add(tracked);
+    return work;
   }
 
   /** Runs the handler and subscribes to its result inside the processing hooks, as the base Server of NestJS 12 */
@@ -438,26 +510,50 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     produce: () => Promise<Observable<any>>,
     respond: (response: WritePacket<any>) => Promise<unknown>,
   ): Promise<void> {
-    const end = () => this.onProcessingEndHook?.(this.transportId, context);
+    const subject = context.getSubject();
+    const end = () => {
+      try {
+        this.onProcessingEndHook?.(this.transportId, context);
+      } catch (err) {
+        this.logger.error(`Processing end hook failed [${subject}]`, stackOf(err));
+      }
+    };
     let processed: () => void;
     const processing = new Promise<void>(resolve => (processed = resolve)).then(() =>
       this.processing.delete(processing),
     );
     this.processing.add(processing);
-    return new Promise((resolve, reject) =>
-      this.onProcessingStartHook(this.transportId, context, async () => {
+    // As a handler error: a JetStream message is NAKed, an RPC request gets an error reply
+    const fail = (err: Error) =>
+      respond({ err: errorReply(HttpStatus.INTERNAL_SERVER_ERROR, err), isDisposed: true }).finally(processed);
+    let started = false;
+    return new Promise(resolve =>
+      this.startProcessing(context, async () => {
+        if (started) return; // the start hook has failed before, and the message with it
+        started = true;
         try {
           this.send((await produce()).pipe(finalize(end)), packet =>
             respond(packet).finally(() => packet.isDisposed && processed()),
           );
-          resolve();
         } catch (err) {
+          this.logger.error(`Processing failed [${subject}]`, stackOf(err));
           end();
-          processed();
-          reject(err);
+          void fail(err);
         }
+        resolve();
+      }).catch(err => {
+        this.logger.error(`Processing start hook failed [${subject}]`, stackOf(err));
+        if (started) return;
+        started = true;
+        void fail(err);
+        resolve();
       }),
     );
+  }
+
+  /** The start hook as a promise, rejected when the hook throws or rejects */
+  private async startProcessing(context: NatsContext, done: () => Promise<void>) {
+    return this.onProcessingStartHook(this.transportId, context, done);
   }
 
   public async handleNatsEvent(channel: string, natsMsg: Msg, handler: MessageHandler<any, any, any>) {
@@ -486,8 +582,8 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     natsMsg: JsMsg,
     handler: MessageHandler<any, any, any>,
     mutex: SimpleMutex,
+    eventOptions = this.buildEventOptions(handler),
   ) {
-    const eventOptions: NatsEventHandlerOptions = { ...this.options.globalEventOptions, ...handler.extras };
     try {
       natsMsg.working();
 
@@ -570,10 +666,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     await this.sendWithHooks(natsCtx, produce, response =>
       respond(response).catch(err => {
         this.logger.error(`Failed to send response [${channel}]`, err?.stack);
-        return this.respondWithError(natsMsg, {
-          message: `Internal Server Error: ${err?.message}`,
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-        });
+        return this.respondWithError(natsMsg, errorReply(HttpStatus.INTERNAL_SERVER_ERROR, err));
       }),
     );
   }
@@ -621,29 +714,8 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     }
   }
 
-  public async handleStatusUpdates(client: NatsConnection) {
-    for await (const status of client.status()) {
-      const data = status.data && isObject(status.data) ? JSON.stringify(status.data) : status.data;
-      if (NATS_STATUS_BY_TYPE[status.type]) this._status$.next(NATS_STATUS_BY_TYPE[status.type]);
-      if (NATS_STATUS_EVENTS.includes(status.type)) this.statusEventEmitter.emit(status.type, status.data);
-
-      switch (status.type) {
-        case 'error':
-        case 'disconnect':
-          this.logger.error(`NatsError: type: "${status.type}", data: "${data}".`);
-          break;
-
-        case 'pingTimer':
-          if (this.options.connection.debug) {
-            this.logger.debug(`NatsStatus: type: "${status.type}", data: "${data}".`);
-          }
-          break;
-
-        default:
-          this.logger.log(`NatsStatus: type: "${status.type}", data: "${data}".`);
-          break;
-      }
-    }
+  public handleStatusUpdates(client: NatsConnection) {
+    return watchStatus(client, this._status$, this.statusEventEmitter, this.logger, this.options.connection?.debug);
   }
 
   protected initializeSerializer(options: NatsServerConnectionOptions) {

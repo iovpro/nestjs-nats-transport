@@ -49,7 +49,7 @@ node test/.build/test/scenarios/main.js rpc-01-malformed-payload
 | `nats-transport-test-outage` | `nats:2.15.0`  | `127.0.0.1:14223`                      | The connection loss scenarios stop and start this container (`docker stop/start`)     |
 | `nats-transport-test-auth`   | `nats:2.15.0`  | `127.0.0.1:14224`                      | Username/password (`nats-auth.conf`); `restricted` may not pull, JetStream is enabled |
 
-The addresses can be overridden with the `NATS_E2E_*` variables (see `test/scenarios/env.ts`). Scenarios `CON-01/02/08–11` use the Docker CLI.
+The addresses can be overridden with the `NATS_E2E_*` variables (see `test/scenarios/env.ts`). Scenarios `CON-01/02/08–11/13` use the Docker CLI.
 
 The users of the server with authentication are defined in `test/nats-auth.conf`: `e2e`/`secret` (CON-03 connects with a wrong password) and `restricted`/`secret`. The `restricted` user may not subscribe to `_INBOX.*`: a JetStream pull consumer receives messages on such an inbox, so every pull is rejected while the connection stays open (CON-05, CON-07). JetStream API replies arrive at `_INBOX.<id>.<token>`, so the stream and the consumer are created.
 
@@ -66,7 +66,6 @@ The users of the server with authentication are defined in `test/nats-auth.conf`
 | UT-10…12  | NAK strategies: regular, increment, fibonacci                                     |
 | UT-13     | Different subjects → different consumer names                                     |
 | UT-14     | Library options from `globalEventOptions` do not reach NATS                       |
-| UT-15     | `false` in the decorator overrides the global `true`                              |
 | UT-16     | The consumer stops on a closed connection                                         |
 | UT-17     | After a failure the consumer restarts in exactly 1 s                              |
 | UT-18     | No restart after `close()` during the pause                                       |
@@ -81,7 +80,7 @@ The users of the server with authentication are defined in `test/nats-auth.conf`
 | UT-28     | `ClientNats`: `maxReconnectAttempts` defaults to `-1`                             |
 | UT-29     | `consume()` buffers `max_handlers` messages when `max_messages` is not set        |
 | UT-30     | `consume()` buffers `max_messages` messages when it is set                        |
-| UT-32     | `ServerNats.unwrap()`: the current connection, an error before `listen()`         |
+| UT-32     | `ServerNats.unwrap()`: the connection, an error before `listen()` and in a pause  |
 | UT-33     | `ServerNats.on()`: connection events reach the listeners until `close()`          |
 | UT-34     | `ClientNats.unwrap()`: the current connection, an error before `connect()`        |
 | UT-35     | `ServerNats.status`: `connected` after `listen()`, then follows NATS              |
@@ -95,7 +94,7 @@ The users of the server with authentication are defined in `test/nats-auth.conf`
 | UT-43     | Core NATS and JetStream events: `0`, `false`, `''` arrive as is                   |
 | UT-44     | `request()` waits `requestTimeout` (30 s), `connection.timeout` has no effect     |
 | UT-45     | After a failed connection the next call connects anew                             |
-| UT-46     | `close()`: subscriptions removed, the in-flight request answered before `drain()` |
+| UT-46     | `close()`: subscriptions drained, the in-flight request answered before `drain()` |
 | UT-47     | `close()` waits for an in-flight handler for at most 10 s                         |
 | UT-48     | `close()` stops the JetStream consumers without a restart                         |
 | UT-49     | `close()`: ack before `drain()`, a message waiting for a handler is not taken     |
@@ -103,6 +102,51 @@ The users of the server with authentication are defined in `test/nats-auth.conf`
 | UT-51     | A second handler on an RPC pattern rejects `start()`, with and without JetStream  |
 | UT-52     | Object patterns are compared the way NestJS normalizes them                       |
 | UT-53     | `listen()` passes `jetStreamOptions` to the JetStream client, as to the manager   |
+| UT-54     | A decorator option set to `undefined` or `null` keeps the global value            |
+| UT-55     | A start hook that fails before `done`: a handler error (3 paths)                  |
+| UT-56     | A start hook that fails after `done` is only logged (3 paths)                     |
+| UT-57     | RPC: `400` only for a request that cannot be deserialized, otherwise `500`        |
+| UT-58     | `ServerNats.status` during the recovery, also after a failed setup                |
+| UT-59     | `close()` while `listen()` connects: `listen()` fails                             |
+| UT-60     | `listen()` after `close()` connects anew and binds the handlers again             |
+| UT-61     | Connection closed during the setup of an attempt: one attempt, one error line     |
+| UT-62     | `close()` while `listen()` waits to retry the credentials fails `listen()`        |
+| UT-63     | An attempt ending after `close()` and a new `listen()` leaves the new one alone   |
+| UT-64     | A consumer bound before `close()` does not restart after a new `listen()`         |
+| UT-65     | `close()` during the pause does not drain the connection that nats.js closed      |
+| UT-66     | A message waiting for a handler at `close()` is not handled after `listen()`      |
+| UT-67     | `close()` stops the reconnects that go on after an authorization retry            |
+| UT-68     | `close()` calls `close()` on the connection when `drain()` does not close it      |
+| UT-69     | `ClientNats.close()` calls `close()` when `drain()` does not close the connection |
+| UT-70     | Empty `filter_subjects` creates a consumer with `filter_subject`                  |
+| UT-71     | `close()` drains the core subscriptions and survives a dead one                   |
+| UT-72     | `ServerNats`: status updates go on past `pingTimer` without `connection`          |
+| UT-74     | `ServerNats.propagatesEventHandlerErrors` is `true`                               |
+| UT-75     | `ClientNats`: status updates go on past `pingTimer` without `connection`          |
+| UT-77     | A listener of `on()` that throws or rejects is logged, the others are called      |
+| UT-79     | `listen()` after a `close()` that came first fails without connecting             |
+| UT-80     | `listen()` again after a failed `listen()` first closes what the failed one runs  |
+| UT-81     | `listen()` during `close()` waits for it and keeps its own connection             |
+| UT-82     | An error thrown by the `listen()` callback completes `listen()` with that error   |
+| UT-83     | `close()` called again while it runs waits for the same close                     |
+| UT-84     | `close()` while NATS is unreachable: unsubscribe and close, no drain              |
+| UT-85     | `close()` stops waiting for the drains once nats.js closes the connection         |
+| UT-86     | `close()` waits for the subscriptions to drain for at most 10 s                   |
+| UT-87     | `close()` does not keep the subscriptions of a connection closed before           |
+| UT-88     | `close()` waits for a message that is still being deserialized (3 paths)          |
+| UT-89     | `close()` during the JetStream setup: no subscriptions, no consumer loops         |
+| UT-90     | `listen()` after `close()` during the reconnect pause still reconnects            |
+| UT-91     | `close()` after a new `listen()` does not wait for a handler given up before      |
+| UT-92     | A start hook that fails and calls `done` afterwards does not run the handler      |
+| UT-93     | A rejection reason that is not an `Error` is logged                               |
+| UT-94     | A handler that rejects fails the message as a handler error (3 paths)             |
+| UT-95     | An end hook that throws is logged, the message is processed                       |
+| UT-96     | The consume loop hands its event options to each message                          |
+| UT-97     | `ClientNats.close()` does not drain a connection that nats.js has closed          |
+| UT-98     | `ClientNats.close()` stops waiting for a drain once nats.js closes the connection |
+| UT-99     | `ClientNats.close()` called again while it runs waits for the same close          |
+| UT-100    | A permissions violation is logged with the operation and the subject              |
+| UT-101    | A failed drain is logged and the connection is closed anyway                      |
 | RPC-01    | A non-JSON request does not crash the service                                     |
 | RPC-02    | An empty request does not crash the service                                       |
 | RPC-03    | A response larger than `max_payload` does not crash the service                   |
@@ -138,6 +182,8 @@ The users of the server with authentication are defined in `test/nats-auth.conf`
 | CON-09    | By default the connection survives an outage longer than the nats.js budget       |
 | CON-10    | `ClientNats` sends requests again after the connection is lost for good           |
 | CON-11    | `status` and `on()` of the server and the client: outage and recovery             |
+| CON-12    | A deleted consumer causes retries, not a pull storm                               |
+| CON-13    | `close()` closes the connection at once while NATS is down                        |
 | HOOK-01   | Handlers run inside the processing hooks: RPC, events, JetStream                  |
 | LOG-01    | The standard Nest logger prints the stack of a handler error                      |
 | LOG-02    | The standard Nest logger prints the stack of an internal library error            |
@@ -177,10 +223,8 @@ Expected: regular — always `nak_delay`; increment — `deliveryCount × nak_de
 Expected: `orders.created.v1` and `orders.created-v1` give different names.
 
 **UT-14 — library options do not reach NATS**
+Steps: the handler options are built from `globalEventOptions` and an empty decorator, then picked for the consumer, as `bindJetStreamEvents()` does.
 Expected: of `globalEventOptions`, only the NATS fields (`max_deliver`) get into the consumer configuration; `nak_delay`, `nak_strategy`, `nak_delay_max`, `max_handlers`, `max_messages` do not.
-
-**UT-15 — `false` in the decorator overrides the global value**
-Expected: `headers_only: true` globally and `headers_only: false` in the decorator give `false`.
 
 UT-16…19 run the `runSubscription` loop with a stubbed consumer and fake timers. The loop is cut after 50 `consume()` calls, so that a regression makes the test fail rather than hang.
 
@@ -217,7 +261,7 @@ Expected: the new connection is closed, no handlers are subscribed on it.
 
 **UT-25 — stopping a consumer on a closed connection**
 Steps: a regular consumer waits for messages; the connection is closed for good. The nats.js `consume()` iterator does not end by itself after the connection closes.
-Expected: the iterator is stopped, the loop exits.
+Expected: the iterator is stopped, the loop exits and does not restart on the closed connection; the only error line is the reconnect.
 
 **UT-26, UT-28 — default `maxReconnectAttempts`** (`ServerNats`, `ClientNats`)
 Expected: nats.js `connect()` gets `maxReconnectAttempts: -1` unless `connection` sets its own value; a value that is set is passed unchanged.
@@ -236,7 +280,7 @@ Expected: `max_messages: 10` with `max_handlers: 5` is passed to `consume()` as 
 UT-32…34 check the abstract methods of NestJS 11+; without them the library sources and `.d.ts` do not compile with NestJS 11 and 12 (COMPAT-01, COMPAT-05).
 
 **UT-32 — `ServerNats.unwrap()`**
-Expected: the error "Not initialized…" before `listen()`, the current connection after it, the new connection after a reconnect, the error again after `close()` — as in the built-in NestJS 11 transport.
+Expected: the error "Not initialized…" before `listen()`, the current connection after it, the error while `ServerNats` waits to connect anew (the closed connection is not kept), the new connection after a reconnect, the error again after `close()` — as in the built-in NestJS 11 transport.
 
 **UT-33 — `ServerNats.on()`**
 Steps: the stubbed connection emits the statuses `disconnect`, `error`, `pingTimer`, `reconnect`, `update`; then `close()` and one more `disconnect`.
@@ -275,8 +319,8 @@ Steps: the consumer lookup times out.
 Expected: `bindJetStreamEvents()` rejects with this error, no consumer is created.
 
 **UT-42 — global NAK options**
-Steps: `globalEventOptions: { nak_delay: 2000, nak_strategy: increment }`; the handler returns `NAK` on the second delivery of a message — without its own options and with `nak_delay: 500` in the decorator.
-Expected: NAK delays of 4000 ms (2 × 2000) and 1000 ms (2 × 500: `nak_delay` from the decorator, the global strategy).
+Steps: `globalEventOptions: { nak_delay: 2000, nak_strategy: increment }`; the handler returns `NAK` on the second delivery of a message — without its own options, with `nak_delay: 500` and with `nak_delay: undefined` in the decorator.
+Expected: NAK delays of 4000 ms (2 × 2000), 1000 ms (2 × 500: `nak_delay` from the decorator, the global strategy) and 4000 ms (`undefined` keeps the global `nak_delay`).
 
 **UT-43 — falsy values in event handlers**
 Steps: `handleNatsEvent` (core NATS) and `handleNatsJetStreamEvent` get the messages `{ pattern: 'orders', data }` with `data` = `0`, `false`, `''`.
@@ -290,11 +334,11 @@ Expected: request timeouts of 30,000 and 5,000 ms.
 Steps: the first connection attempt is rejected, then `connect()` is called again.
 Expected: the second call opens a new connection. Concurrent `connect()` calls wait for one shared attempt; the test checks that a failed attempt is not handed to the next calls.
 
-UT-46…49 check the server shutdown: `close()` stops taking messages, waits for the in-flight handlers for at most 10 s (`GRACE_PERIOD`), and only then calls `drain()`. In UT-46 and UT-47 an RPC request is processed on a stubbed connection, in UT-48 and UT-49 JetStream messages are processed in the `runSubscription` loop with a stubbed consumer.
+UT-46…49 check the server shutdown: `close()` stops taking messages, waits for the in-flight handlers for at most 10 s (`GRACE_PERIOD`), and only then drains the connection. In UT-46 and UT-47 an RPC request is processed on a stubbed connection, in UT-48 and UT-49 JetStream messages are processed in the `runSubscription` loop with a stubbed consumer.
 
 **UT-46 — in-flight request at `close()`**
 Steps: a request is in progress; `close()` is called; then the handler completes.
-Expected: the subscription is removed at once, the reply is sent before `drain()`.
+Expected: the subscription is drained at once, so the messages NATS has routed to it are still delivered; the reply is sent before the connection drains.
 
 **UT-47 — wait limit**
 Steps: the request handler never completes.
@@ -325,6 +369,193 @@ Expected: `start()` passes the error for the pattern `{"cmd":"get","v":1}` to th
 **UT-53 — `jetStreamOptions` of the JetStream client**
 Steps: `listen()` of a server with `jetStream: true` and `jetStreamOptions: { domain: 'hub' }` on a stubbed connection.
 Expected: `jetstream()` and `jetstreamManager()` get `{ domain: 'hub' }` — the options apply both to creating the consumers and to looking them up and reading from them.
+
+**UT-54 — `undefined` and `null` in the decorator**
+Steps: `globalEventOptions: { ack_wait: 120 s, max_deliver: 5, deliver_policy: All, headers_only: true }`; the decorator sets `ack_wait: undefined`, `max_deliver: null` and `deliver_policy: undefined`, as values from a configuration that does not set them, and `headers_only: false`; `bindJetStreamEvents()` runs on the stubbed JetStream API of UT-40.
+Expected: the new consumer gets the global `ack_wait`, `max_deliver` and `deliver_policy`, and `headers_only: false` from the decorator.
+
+UT-55 and UT-56 run a JetStream message, an RPC request and a core NATS event through a server whose start hook fails: it throws or returns a rejected promise.
+
+**UT-55 — start hook fails before `done`**
+Expected: the handler and the end hook are not called; the JetStream message is NAKed, not terminated, and its handler slot is released; the RPC request gets `{ message: 'Internal Server Error: no traceparent', statusCode: 500 }`; no message is left among the handlers in progress that `close()` waits for; one error line per message.
+
+**UT-56 — start hook fails after `done`**
+Expected: the processing goes on as usual: the handler and the end hook are called, the JetStream message is acknowledged and its slot is released once, the RPC request gets the handler's reply; the failure is only logged.
+
+**UT-57 — RPC error reply codes**
+Steps: a request that is not JSON, and a valid request to a handler registered with `addHandler()` that rejects with `connect ECONNREFUSED 10.0.0.5:5432`: such a handler runs without the interceptor and the filters that turn errors into replies.
+Expected: `Bad Request: Bad JSON` with `400` for the first request, `Internal Server Error: connect ECONNREFUSED 10.0.0.5:5432` with `500` for the second.
+
+**UT-58 — `ServerNats.status` during the recovery**
+Steps: as in UT-22: the connection is closed for good, the next attempt connects but JetStream does not respond, the attempt after it succeeds.
+Expected: `connected` → `reconnecting` once the connection is closed for good → `connected` when the attempt connects → `reconnecting` when its setup fails → `connected`.
+
+UT-59…65 and UT-67 use the stubbed connections of UT-21…25, UT-66 the consumer of UT-48 and UT-49.
+
+**UT-59 — `close()` while `listen()` connects**
+Steps: `close()` is called while `listen()` opens its first connection; then the connection opens.
+Expected: `close()` calls the `listen()` callback once with the error `ServerNats was closed before listen() completed`: `app.listen()` rejects, the bootstrap does not go on; the connection is closed, no handlers are subscribed on it; `unwrap()` throws, the closed connection is not kept.
+
+**UT-60 — `listen()` after `close()`**
+Steps: `listen()`, `close()` and `listen()` again on the same instance, as after `app.getTransportServer().close()` in NestJS 12.
+Expected: `close()` does not call the callback of the first `listen()` again; the new connection stays open, the RPC handler is subscribed on it, the callback is called once without an error, `unwrap()` returns the new connection.
+
+**UT-61 — a connection closed for good during the setup of an attempt**
+Steps: the attempt after the first failure connects and waits for the JetStream API; nats.js closes its connection for good and fails the pending request, so both the `closed()` handler and the `listen()` callback report the failure.
+Expected: one reconnect is scheduled, not two, and the failure is logged once; 5 s later one new connection, the RPC handler is subscribed on it.
+
+**UT-62 — `close()` while `listen()` waits to retry the credentials**
+Steps: NATS rejects the credentials (`AUTHORIZATION_VIOLATION`); `close()` is called during the 5 s pause before the next attempt.
+Expected: the `listen()` callback is called once with the error `ServerNats was closed before listen() completed`: `app.listen()` rejects; no attempt after `close()`.
+
+UT-63, UT-64 and UT-66 restart the server with `close()` and `listen()` while something of the first `listen()` is still running.
+
+**UT-63 — an attempt that ends after `close()` and a new `listen()`**
+Steps: the connection is closed for good, the reconnect attempt is still connecting when `close()` and `listen()` are called; the new `listen()` connects; then the old attempt connects or fails.
+Expected: the old attempt subscribes nothing and schedules no reconnect; the new connection stays open, `unwrap()` returns it.
+
+**UT-64 — a consumer bound before `close()`**
+Steps: a pull fails and the consumer waits 1 s to restart; `close()` and `listen()` are called during the pause.
+Expected: the consumer is not restarted.
+
+**UT-65 — `close()` while `ServerNats` waits to reconnect**
+Steps: the connection is closed for good; `close()` is called during the 5 s pause. As in nats.js, the closed connection cannot be drained (`CONNECTION_CLOSED`).
+Expected: `drain()` is not called, no error besides the reconnect line.
+
+**UT-66 — a message waiting for a handler at `close()`**
+Steps: as in UT-49, the handler of the first message is in progress and the second message waits; the handler outlasts the 10 s of `close()`; `listen()` is called, then the handler finishes.
+Expected: the first message is acknowledged, the second is not handled.
+
+**UT-67 — reconnects after an authorization retry**
+Steps: the connection is closed for good; the next attempt is rejected with `AUTHORIZATION_VIOLATION`, the one after it with `CONNECTION_REFUSED`, the next one is still connecting when `close()` is called and fails afterwards.
+Expected: no reconnect is scheduled after `close()`: the authorization retry belongs to the same `listen()` as the reconnects.
+
+**UT-68 — `close()` calls `close()` after `drain()`**
+Steps: a server with a fake connection where `drain()` resolves but `isClosed()` returns `false` — as nats.js does when the final flush of a drain fails during a network outage with infinite reconnect.
+Expected: `drain()` is called first, then `close()`: the connection does not stay open and reconnecting.
+
+**UT-69 — `ClientNats.close()` calls `close()` after `drain()`**
+Steps: a client with a fake connection, same conditions as UT-68.
+Expected: `drain()` first, then `close()`.
+
+**UT-70 — empty `filter_subjects`**
+Steps: a handler with `filter_subjects: []` is bound.
+Expected: the consumer is created with `filter_subject: 'orders.created'` — the handler's own subject, not without a filter.
+
+**UT-71 — draining the core subscriptions**
+Steps: `close()` of a listening server whose subscription cannot be drained (`SUB_CLOSED`, as after a permissions violation).
+Expected: `drain()` is called for the subscription, not `unsubscribe()`; its failure does not fail `close()`.
+
+**UT-72, UT-75 — status updates without the `connection` option** (`ServerNats`, `ClientNats`)
+Steps: an instance created from JavaScript without `connection` gets the status `pingTimer`, which is logged only with `connection.debug`.
+Expected: the status loop goes on and ends with the feed instead of failing on `connection.debug`.
+
+**UT-74 — `propagatesEventHandlerErrors`**
+Expected: `true`: NestJS 12 does not log again the errors of event handlers that `ServerNats` handles itself (NAK for JetStream).
+
+**UT-77 — listeners of `on()` that fail** (`src/connection/nats-connection.spec.ts`)
+Steps: three listeners of `disconnect`: the first one throws, the second one rejects (an alert sent over the network that fails in the same outage), the third one records the call; the statuses `disconnect` and `reconnect`.
+Expected: both failures are logged as `Status listener for "disconnect" failed` with the stack, the third listener is called, the `reconnect` status is logged: the status loop goes on and the process does not end with an unhandled rejection.
+
+UT-79…91 use the stubbed connections of UT-21…25 and the request and consumer of UT-46…49. They check `listen()` and `close()` called in any order and the shutdown while NATS does not answer.
+
+**UT-79 — `listen()` after a `close()` that came first**
+Steps: `close()`, then `listen()` — as when `app.close()` comes while NestJS runs the init hooks of the application, before it calls `listen()`.
+Expected: the callback gets `ServerNats was closed before listen() completed`, no connection is opened.
+
+**UT-80 — `listen()` again after a failed `listen()`**
+Steps: the first `listen()` connects and fails (JetStream does not respond); a consumer bound before the failure waits for messages; `listen()` is called again without `close()`.
+Expected: the consumer of the failed `listen()` is stopped and its connection drained before the new one is opened; the new connection stays open.
+
+**UT-81 — `listen()` while `close()` waits for a handler**
+Steps: a request is in progress; `close()` is called and, without waiting for it, `listen()`; then the request completes.
+Expected: `listen()` does not connect before `close()` ends; `close()` drains its own connection, not the new one; `unwrap()` returns the new connection.
+
+**UT-82 — an error thrown by the `listen()` callback**
+Steps: the callback throws when it is called without an error, as NestJS does when its logger throws on "successfully started".
+Expected: the callback is called again with that error: `app.listen()` rejects instead of hanging.
+
+**UT-83 — `close()` called again while it runs**
+Steps: a request is in progress; `close()` is called twice; the connection, as in nats.js, refuses a second `drain()` with `CONNECTION_DRAINING`.
+Expected: both calls complete, the connection is drained once, no error is logged.
+
+**UT-84 — `close()` while NATS is unreachable**
+Steps: the connection reports `disconnect`; `close()` is called.
+Expected: the subscription is unsubscribed, not drained; the connection is closed without a drain, which would wait for the next reconnect attempt.
+
+**UT-85 — nats.js closes the connection during `close()`**
+Steps: NATS stops answering: the drains of the subscription and of the connection never complete; then nats.js closes the connection for good.
+Expected: `close()` completes instead of waiting forever.
+
+**UT-86 — subscription drain limit**
+Steps: the drain of the subscription never completes.
+Expected: the connection is not drained after 9,999 ms and is drained after 10,000 ms.
+
+**UT-87 — subscriptions of a connection closed before**
+Steps: the connection is closed for good, `ServerNats` connects anew, then `close()`.
+Expected: `close()` drains the subscription of the new connection only; no subscription is kept after `close()`.
+
+**UT-88 — a message that is deserialized at `close()`**
+Steps: for an RPC request, a core event and a JetStream message; the deserializer takes 20 ms; the message arrives, then `close()` is called at once.
+Expected: the reply, the handler call or the ack comes before the connection drains.
+
+**UT-89 — `close()` during the JetStream setup**
+Steps: an RPC handler and a JetStream handler; `close()` is called while `listen()` waits for the JetStream manager or for the stream of the consumer, and a handler in progress keeps `close()` waiting.
+Expected: the setup subscribes no RPC subject and starts no consumer loop.
+
+**UT-90 — `listen()` after `close()` during the reconnect pause**
+Steps: the connection is closed for good, `close()` cancels the scheduled reconnect, `listen()` connects; then its connection is closed for good too.
+Expected: `ServerNats` connects anew 5 s later and subscribes the handler.
+
+**UT-91 — a handler given up by `close()`**
+Steps: the handler of a request never completes; `close()` gives up on it after 10 s; `listen()` and `close()` again.
+Expected: the second `close()` completes at once.
+
+UT-92…95 use the three processing paths of UT-37 and UT-38.
+
+**UT-92 — a start hook that fails and calls `done` afterwards**
+Steps: the start hook schedules `done` in 10 ms and returns a rejected promise.
+Expected: the handler and the end hook are not called; the JetStream message is NAKed once and its handler slot released once; the RPC request gets one reply, the error.
+
+**UT-93 — a rejection reason that is not an `Error`**
+Steps: the start hook rejects with the string `tracer not ready`.
+Expected: the error line `Processing start hook failed [orders]` carries `'tracer not ready'` in place of the stack.
+
+**UT-94 — a handler that rejects**
+Steps: the handler rejects with `db down`, as a handler added with `addHandler()` or a controller method whose exception filter throws.
+Expected: the JetStream message is NAKed, not terminated, and its slot released; the RPC request gets `Internal Server Error: db down` with `500`; each path logs `Processing failed [orders]`; nothing is left in processing.
+
+**UT-95 — an end hook that throws**
+Steps: the end hook throws; the handler fails or succeeds.
+Expected: `Processing end hook failed [orders]` is logged; the message is processed as without the end hook: NAK and `500` for the failure, ack and the reply for the success; nothing is left in processing.
+
+**UT-96 — event options of the consume loop**
+Steps: `globalEventOptions: { nak_delay: 2000 }`, the loop runs with `nak_delay: 500`; two messages, the handler returns `NAK`.
+Expected: both messages are NAKed with 500 ms; the handler options are not built again for each message.
+
+UT-97…99 run `ClientNats.close()` on a stubbed connection (`src/client/client-nats.spec.ts`).
+
+**UT-97 — a connection that nats.js has closed**
+Steps: nats.js has given up reconnecting and no request has come since; `close()`.
+Expected: no `drain()`, no error in the log.
+
+**UT-98 — nats.js closes the connection during `close()`**
+Steps: the drain never completes; nats.js closes the connection for good.
+Expected: `close()` completes.
+
+**UT-99 — `close()` called again while it runs**
+Steps: two `close()` calls; the connection refuses a second `drain()`, as nats.js does.
+Expected: one `drain()`, no error in the log.
+
+UT-100 and UT-101 check the connection handling shared by `ServerNats` and `ClientNats` (`src/connection/nats-connection.spec.ts`).
+
+**UT-100 — permissions violation**
+Steps: the status `error` with the data `PERMISSIONS_VIOLATION` and the `permissionContext` that nats.js adds, then the status `disconnect`.
+Expected: `NatsError: type: "error", data: "PERMISSIONS_VIOLATION", permissionContext: {"operation":"subscription","subject":"orders.get"}.`; the `disconnect` line has no context.
+
+**UT-101 — a drain that fails**
+Steps: `drain()` rejects with `CONNECTION_DRAINING`.
+Expected: the error `Failed to drain the NATS server due to an error, forcibly closing the connection: reason=CONNECTION_DRAINING` is logged and the connection is closed.
 
 ### RPC (`test/e2e/rpc.e2e-spec.ts`, `test/scenarios/rpc.scenarios.ts`)
 
@@ -470,6 +701,14 @@ Expected: after NATS returns, the client requests succeed again.
 **CON-11 — status and events during an outage** (`con-11-status-and-events`)
 Steps: an RPC service and `ClientNats` on `nats-outage` (`reconnectTimeWait: 250`, unlimited attempts), subscribed to `status` and `on('disconnect' | 'reconnect')`; NATS is stopped for 2 s; then an RPC request is sent.
 Expected: the server and the client go through the statuses `connected`, `disconnected`, `reconnecting`, `connected` and get the events `disconnect` and `reconnect` with the server address (a string); the request succeeds.
+
+**CON-12 — a deleted consumer causes retries, not a pull storm** (`con-12-consumer-deleted-storm`)
+Steps: a JetStream handler on `nats-main`; after 1 s the consumer is deleted; 3 s of observation; `app.close()`.
+Expected: 1–10 error lines in 3 s: the missing consumer is reported once a second (`abort_on_missing_resource: true`) instead of a storm of pull requests that nats.js would send with no error in the log (about 24,000 per second).
+
+**CON-13 — `close()` while NATS is down** (`con-13-close-during-outage`)
+Steps: an RPC handler on `nats-outage` with the default `maxReconnectAttempts: -1`; NATS is stopped; after 2 s `app.close()`. The scenario process ends right after the scenario, so the connection itself is checked.
+Expected: the connection is closed (otherwise nats.js reconnects forever and keeps the process alive), and `close()` takes less than 1 s: it does not drain while NATS is unreachable, a drain would wait for the next reconnect attempt (2 s by default).
 
 ### Processing hooks (`test/e2e/hooks.e2e-spec.ts`, `test/scenarios/hooks.scenarios.ts`)
 

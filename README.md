@@ -43,7 +43,7 @@ Requirements:
 
 - Node.js >= 16 with NestJS 10, >= 20 with NestJS 11, 20.19+ or 22.12+ with NestJS 12
 - NestJS 10, 11 or 12
-- `nats` 2.29.2 or a later 2.x: a peer dependency, installed next to the library
+- `nats` 2.29.2 or a later 2.x: a peer dependency, installed next to the library. The `nats` package (nats.js v2) is deprecated in favor of the modular `@nats-io/*` packages (v3); the library will migrate to v3 in a future major version
 - NATS Server 2.2+; JetStream handlers need 2.9.4+ (`filter_subjects` and `metadata`: 2.10+)
 
 NestJS 12 is published as ES modules. The library is built as CommonJS and loads NestJS with `require()`, which Node.js supports for ES modules since 20.19 and 22.12.
@@ -178,6 +178,12 @@ const server = new ServerNats({
     // All options from official NATS client
     maxReconnectAttempts: -1,
     reconnectTimeWait: 2000,
+    // TLS: recommended for production, especially when passing credentials or tokens in headers
+    tls: {
+      certFile: './certs/client-cert.pem',
+      keyFile: './certs/client-key.pem',
+      caFile: './certs/ca.pem',
+    },
   },
 
   // Enable JetStream support
@@ -197,6 +203,8 @@ const server = new ServerNats({
   },
 
   // Custom serializers/deserializers (optional)
+  // A custom deserializer must return the NestJS envelope shape { pattern, data }
+  // (IncomingRequest for RPC, IncomingEvent for events); the handler receives the `data` field
   serializer: new CustomSerializer(),
   deserializer: new CustomDeserializer(),
 });
@@ -208,11 +216,19 @@ const server = new ServerNats({
 
 If nats.js closes the connection for good (the attempts allowed by `maxReconnectAttempts` run out, or the server rejects the credentials twice in a row), `ServerNats` logs the error and connects anew every 5 seconds (`RECONNECT_DELAY`) until it succeeds or `close()` is called: it sets up the streams again and restores the JetStream consumers and the RPC and event subscriptions. An attempt that connects but cannot create a consumer (for example, its stream was deleted and is not in the stream configs) is retried the same way. `ClientNats` opens a new connection on the next request; while NATS is unreachable, the request fails with the connection error.
 
-If NATS rejects the credentials when `listen()` connects (`AUTHORIZATION_VIOLATION`), `ServerNats` logs the error and tries again every 5 seconds until it connects or `close()` is called, so the service can start before NATS loads its new credentials. Meanwhile `listen()` does not complete.
+If NATS rejects the credentials when `listen()` connects (`AUTHORIZATION_VIOLATION`), `ServerNats` logs the error and tries again every 5 seconds until it connects or `close()` is called, so the service can start before NATS loads its new credentials. Meanwhile `listen()` does not complete; `close()` makes it reject.
 
 ### Shutdown
 
-`close()` (called by `app.close()`) stops taking messages: it unsubscribes from the subjects and stops the JetStream consumers. Then it waits until the handlers in progress have replied or acknowledged their messages, for at most `GRACE_PERIOD` (10 seconds), and drains the connection. A JetStream message that waits in the client buffer for a free handler is not processed: NATS delivers it again after `ack_wait`.
+`close()` (called by `app.close()`) stops taking messages: it drains the subscriptions, so the requests and events that NATS has already routed to the service are still handled, and stops the JetStream consumers. Then it waits until the handlers in progress, including the messages that are still being deserialized, have replied or acknowledged their messages, and drains the connection. The drain of the subscriptions and the wait for the handlers take at most `GRACE_PERIOD` (10 seconds) together; the drain of the connection takes one more round trip to NATS. A JetStream message that waits in the client buffer for a free handler is not processed: NATS delivers it again after `ack_wait`.
+
+While NATS is unreachable, `close()` does not drain, since a drain would wait for the next reconnect attempt: it unsubscribes, waits for the handlers in progress as above and closes the connection; the replies that handlers send meanwhile are lost. If nats.js closes the connection for good while `close()` waits (the reconnect attempts run out), `close()` goes on at once. A `close()` called again, also while the first one runs, waits for the same close.
+
+If `close()` is called before `listen()` has completed (while it connects, sets up the streams and consumers, or waits to retry rejected credentials), `listen()` rejects with `ServerNats was closed before listen() completed`, and a connection it opens afterwards is closed. A `listen()` after a `close()` that came first rejects the same way without connecting: NestJS calls `listen()` after the init hooks of the application, so `app.close()` during them closes the server before it starts. The code after `await app.listen()` or `await app.startAllMicroservices()` does not run then, and the bootstrap stops.
+
+After `close()` the same application can call `listen()` again, for example after `app.getTransportServer().close()` in NestJS 12: `ServerNats` connects anew and subscribes the handlers again. `close()` removes the listeners registered with `on()`, so register them again. A `listen()` called while `close()` runs waits for it. A `listen()` called again without `close()`, for example after a `listen()` that has rejected, first closes the connection and the consumers of the previous one.
+
+An instance keeps the handlers of the application that registered them, so give each application its own `ServerNats`. With a reused instance, `listen()` of the next application rejects with `Several handlers for the … pattern` only when both applications register the same RPC or JetStream pattern. Otherwise the handlers of the closed application stay subscribed: the requests and JetStream messages on their patterns reach them, and each NATS event of a pattern that both applications handle reaches both.
 
 ### Connection Status and Events
 
@@ -225,7 +241,7 @@ app.on('reconnect', (server: string) => console.log(`NATS ${server} is back`));
 app.on('update', ({ added, deleted }: { added: string[]; deleted: string[] }) => console.log(added, deleted));
 ```
 
-`close()` removes the listeners. While `ServerNats` connects anew after the connection was closed for good, the status stays `reconnecting` until an attempt connects.
+`close()` removes the listeners. A listener that throws or rejects is logged, and the other listeners of the event are still called. While `ServerNats` connects anew after the connection was closed for good, the status stays `reconnecting` until an attempt connects; if the attempt then fails to set up the streams, consumers or subscriptions, the status goes back to `reconnecting`. In this pause `unwrap()` throws: there is no connection.
 
 ### Processing Hooks
 
@@ -243,6 +259,8 @@ strategy.setOnProcessingEndHook((transportId, context) =>
   console.log('processed', (context as NatsContext).getSubject()),
 );
 ```
+
+If the start hook throws or rejects before it calls `done`, the handler and the end hook are not called: `ServerNats` logs the error and handles the message as if the handler had failed. A JetStream message is NAKed and delivered again, an RPC request gets the reply `{ message: 'Internal Server Error: <error message>', statusCode: 500 }`, and a NATS event is only logged. A `done` called after such a failure does nothing. An error after `done` is called is only logged, and so is an error of the end hook: the message is processed as without it.
 
 ### Setting up JetStream Streams
 
@@ -288,7 +306,9 @@ async function bootstrap() {
 bootstrap();
 ```
 
-`listen()` resolves once the consumers of all JetStream handlers are created. If a consumer cannot be created — no stream stores the subject of a handler, or the NATS server rejects the consumer configuration — `listen()` rejects with the error. The consumers created by then keep running until `close()`: if the application handles the error and goes on, call `app.close()`.
+`listen()` resolves once the consumers of all JetStream handlers are created. If a consumer cannot be created — no stream stores the subject of a handler, or the NATS server rejects the consumer configuration — `listen()` rejects with the error. The connection and the consumers created by then keep running until `close()` or the next `listen()`: if the application handles the error and goes on, call `app.close()` or `listen()` again.
+
+Stream setup reads the first page of the stream list (up to 256 streams on a typical NATS server). If there are more streams, an existing stream may not be found: `ServerNats` then creates it with `streams.add`, which NATS accepts when the configuration is the same (the log still says `Stream … created`) and rejects when it differs, so `listen()` rejects. When updating an existing stream, the new configuration is merged with the current one (`{ ...currentConfig, ...newConfig }`): a field removed from the config keeps its previous value on the server; to remove it, delete and recreate the stream.
 
 Keep RPC subjects out of the streams' subjects: a stream stores a request sent to its subject and replies with its acknowledgement, which `request()` returns instead of the handler's reply.
 
@@ -755,6 +775,8 @@ async handleCriticalOrders(@Payload() data: OrderData) {
 }
 ```
 
+A decorator setting that is `undefined` or `null`, such as a value from a configuration that does not set it, keeps the global setting.
+
 ## JetStream
 
 ### What is JetStream?
@@ -958,7 +980,7 @@ async processOrder(@Payload() data: OrderData) {
 
 **Important**:
 
-- On every start the library updates the existing consumer with the handler options, except `deliver_policy`, `opt_start_seq` and `opt_start_time`: they apply to a new consumer only. An option removed from the decorator keeps its value on the server
+- On every start the library updates the existing consumer with the handler options, except `deliver_policy`, `opt_start_seq` and `opt_start_time`: they apply to a new consumer only. An option removed from the decorator keeps its value on the server. Falsy values (`0`, `false`, empty string) in numeric and boolean options such as `max_deliver`, `max_ack_pending` and `mem_storage` are not sent either: set them to a positive value or delete and recreate the consumer. The exception is `headers_only`, which accepts `false` explicitly
 - To apply such a change, or one that NATS refuses for an existing consumer (for example, a switch to `filter_subjects`, which makes `listen()` reject), delete the consumer and restart the service: the library creates the consumer anew when it starts
 - If a consumer disappears while the service runs (it is deleted, or it is kept in memory with `mem_storage: true` and the NATS server restarts), the handler logs `Consumer [<subject>] failed` once a second and resumes when the consumer exists again, for example after the service restarts
 
@@ -1152,6 +1174,8 @@ If a request payload cannot be deserialized (for example, it is not valid JSON o
 
 If a response cannot be sent (for example, it exceeds the server's `max_payload` or cannot be serialized to JSON, such as a `BigInt` or a circular structure), the service logs the error and replies with `statusCode: 500` and the reason in `message`, for example `'Internal Server Error: MAX_PAYLOAD_EXCEEDED'` or `'Internal Server Error: Bad JSON'`.
 
+Other failures of the request processing that the interceptor does not turn into a reply, such as a processing start hook that throws or a handler registered with `server.addHandler()` that rejects, get the same reply with `statusCode: 500`: only a payload that cannot be deserialized gets `400`.
+
 ### Client-Side Error Handling
 
 ```typescript
@@ -1237,6 +1261,8 @@ async processOrder(@Payload() data: OrderData) {
   }
 }
 ```
+
+A failure that reaches `ServerNats` as a rejected promise instead of an error result is handled the same way as a handler error: a handler registered with `server.addHandler()` that rejects, or an exception filter that throws instead of returning `throwError()`. The JetStream message is NAKed and delivered again, a NATS event is logged with `Processing failed [<subject>]`. Only a message that cannot be deserialized is terminated.
 
 ## Working with Headers
 
@@ -2017,9 +2043,9 @@ interface NatsServerConnectionOptions {
 
 #### Methods
 
-- `listen(callback: (err?: unknown) => void): Promise<void>` - Start server; the callback gets the error if the server cannot start, except an authorization error, which is retried every 5 seconds
-- `close(): Promise<void>` - Stop taking messages, wait up to `GRACE_PERIOD` (10 s) for the handlers in progress to reply or ack, then drain the connection
-- `unwrap<T>(): T` - Get the native NATS connection (`app.unwrap()` in NestJS 11+); throws before `listen()`
+- `listen(callback: (err?: unknown) => void): Promise<void>` - Start server; the callback gets the error if the server cannot start or `close()` comes first, except an authorization error, which is retried every 5 seconds
+- `close(): Promise<void>` - Stop taking messages, wait up to `GRACE_PERIOD` (10 s) for the handlers in progress to reply or ack, then drain the connection (close it at once while NATS is unreachable)
+- `unwrap<T>(): T` - Get the native NATS connection (`app.unwrap()` in NestJS 11+); throws before `listen()`, while `ServerNats` connects anew after the connection was closed for good, and after `close()`
 - `status: Observable<string>` - Connection status: `connected`, `disconnected`, `reconnecting` (`app.status` in NestJS 11+)
 - `on(event: string, callback: Function): void` - Listen to `disconnect`, `reconnect` and `update` (`app.on()` in NestJS 11+)
 - `setOnProcessingStartHook(hook)`, `setOnProcessingEndHook(hook)` - Processing hooks for tracing tools
@@ -2051,13 +2077,13 @@ interface NatsClientConnectionOptions {
 #### Methods
 
 - `request<TResult, TInput>(pattern: string | string[], data: TInput, headers?: Record<string, any>): Promise<TResult>` - RPC request; header values other than strings are sent as JSON
-- `event<TInput>(pattern: string | string[], data: TInput, headers?: Record<string, any>): Promise<void>` - Send event
+- `event<TInput>(pattern: string | string[], data: TInput, headers?: Record<string, any>): Promise<void>` - Send event; with `jetStream: true` it resolves once a stream stores the message, but the `PubAck` details (`seq`, `duplicate`) are not returned — use `getJetStreamClient().publish()` when you need them
 - `getClient(): NatsConnection | undefined` - Get native NATS client; `undefined` until the client connects (first request or event, or `await client.connect()`)
 - `getJetStreamClient(): JetStreamClient | undefined` - Get JetStream client; `undefined` until the client connects or without `jetStream: true`
 - `unwrap<T>(): T` - Get the native NATS connection; throws before `connect()`
 - `status: Observable<string>` - Connection status: `connected`, `disconnected`, `reconnecting`
 - `on(event: string, callback: Function): void` - Listen to `disconnect`, `reconnect` and `update`
-- `close(): Promise<void>` - Drain and close the connection: published messages are flushed, requests that still wait for a reply fail with `TIMEOUT`
+- `close(): Promise<void>` - Drain and close the connection: published messages are flushed, requests that still wait for a reply fail with `TIMEOUT`; a `close()` called again while the first one runs waits for the same close
 
 ---
 

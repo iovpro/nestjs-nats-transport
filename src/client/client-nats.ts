@@ -18,7 +18,7 @@ import { NatsResponseJSONDeserializer } from '../deserializers';
 import { Observable, ReplaySubject, distinctUntilChanged, firstValueFrom } from 'rxjs';
 import { EventEmitter } from 'events';
 import { NatsRpcException } from '../exceptions/rpc-exception';
-import { NATS_STATUS_BY_TYPE, NATS_STATUS_EVENTS } from '../constants';
+import { addStatusListener, closeConnection, watchStatus } from '../connection/nats-connection';
 
 /**
  * @publicApi
@@ -30,6 +30,7 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
   protected natsClient: NatsConnection;
   protected jetstreamClient: JetStreamClient;
   private connectionPromise: Promise<NatsConnection>;
+  private closePromise: Promise<void>;
   protected _status$ = new ReplaySubject<string>(1);
   private readonly statusEventEmitter = new EventEmitter();
 
@@ -42,21 +43,16 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
     this.initializeDeserializer(options);
   }
 
-  public async close() {
+  public close() {
+    // close() called again while the close runs waits for the same close
+    this.closePromise ??= this.disconnect().finally(() => (this.closePromise = undefined));
+    return this.closePromise;
+  }
+
+  private async disconnect() {
     if (!this.natsClient) return;
 
-    try {
-      await this.natsClient.drain();
-      if (!this.natsClient.isClosed()) await this.natsClient.close();
-    } catch (error) {
-      this.logger.error(
-        `Failed to drain the NATS client due to an error, forcibly closing the connection: reason=${error.code}`,
-        error?.stack,
-      );
-
-      await this.natsClient?.close();
-    }
-
+    await closeConnection(this.natsClient, this.logger, 'client');
     this.natsClient = undefined;
     this.jetstreamClient = undefined;
     this.statusEventEmitter.removeAllListeners();
@@ -123,32 +119,11 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
   }
 
   public on(event: string, callback: Function) {
-    this.statusEventEmitter.on(event, callback as (...args: unknown[]) => void);
+    addStatusListener(this.statusEventEmitter, this.logger, event, callback);
   }
 
-  public async handleStatusUpdates(client: NatsConnection) {
-    for await (const status of client.status()) {
-      const data = status.data && isObject(status.data) ? JSON.stringify(status.data) : status.data;
-      if (NATS_STATUS_BY_TYPE[status.type]) this._status$.next(NATS_STATUS_BY_TYPE[status.type]);
-      if (NATS_STATUS_EVENTS.includes(status.type)) this.statusEventEmitter.emit(status.type, status.data);
-
-      switch (status.type) {
-        case 'error':
-        case 'disconnect':
-          this.logger.error(`NatsError: type: "${status.type}", data: "${data}".`);
-          break;
-
-        case 'pingTimer':
-          if (this.options.connection.debug) {
-            this.logger.debug(`NatsStatus: type: "${status.type}", data: "${data}".`);
-          }
-          break;
-
-        default:
-          this.logger.log(`NatsStatus: type: "${status.type}", data: "${data}".`);
-          break;
-      }
-    }
+  public handleStatusUpdates(client: NatsConnection) {
+    return watchStatus(client, this._status$, this.statusEventEmitter, this.logger, this.options.connection?.debug);
   }
 
   private prepareSubjectPattern(pattern: any) {
