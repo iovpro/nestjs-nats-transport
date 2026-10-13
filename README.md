@@ -30,6 +30,7 @@ A full-featured transport layer library for NestJS providing integration with NA
 ✅ **Flexible Event Handling** - Support for both traditional pub/sub and JetStream event streaming
 ✅ **NAK Strategies** - Smart retry management with regular, incremental, and Fibonacci backoff delays
 ✅ **Header Support** - Pass metadata through NATS headers to handlers and set headers on RPC replies
+✅ **Request Context** - Propagate traceId and requestId across services via NATS headers with `requestContext: true`
 ✅ **Concurrency Control** - Limit the number of concurrent JetStream handlers (`max_handlers`)
 ✅ **TypeScript & DI** - Full integration with TypeScript type system and NestJS Dependency Injection
 
@@ -245,7 +246,7 @@ app.on('update', ({ added, deleted }: { added: string[]; deleted: string[] }) =>
 
 ### Processing Hooks
 
-NestJS 11.1.4 and later let tracing tools wrap message processing with processing hooks; `ServerNats` supports them with NestJS 10 too. It runs every handler (RPC, NATS events and JetStream events) inside the start hook and calls the end hook when the handler's result completes, before the reply or the ack is sent. The context is a `NatsContext`: `getSubject()` and `getHeaders()` give what a trace needs.
+NestJS 11.1.4 and later let tracing tools wrap message processing with processing hooks; `ServerNats` supports them with NestJS 10 too. It runs every handler (RPC, NATS events and JetStream events) inside the start hook and calls the end hook when the handler's result completes, before the reply or the ack is sent. The context is a `NatsContext`: `getSubject()` and `getHeaders()` give what a trace needs. With `requestContext: true`, the start and end hooks already run inside `RequestContext`.
 
 ```typescript
 const trace = new AsyncLocalStorage<string>();
@@ -1379,6 +1380,8 @@ export class OrderController {
 
 ### Propagating Headers Between Services
 
+When `requestContext: true` is enabled, `x-trace-id` and `x-request-id` are propagated automatically. Manual header propagation is only needed for application-specific headers. See [Request Context](#request-context-traceid-and-requestid) for details.
+
 ```typescript
 import { Payload, Ctx } from '@nestjs/microservices';
 
@@ -1847,7 +1850,54 @@ export class OrderService {
 }
 ```
 
+### Request Context (traceId and requestId)
+
+For simple cross-service tracing without OpenTelemetry, enable `requestContext: true` on both the client and the server.
+
+**Client** (`ClientNats`) adds `x-trace-id` and `x-request-id` from the current `RequestContext` to all outgoing messages — `request()`, `event()`, `send()` and `emit()`. Explicit headers from the caller take precedence; header names are compared case-insensitively.
+
+**Server** (`ServerNats`) restores the context from incoming message headers. The context covers message deserialization, processing hooks, guards, interceptors, pipes, the handler, the reply or ack/nak/term, and all library log lines about that message. Without an `x-trace-id` header, the server calls `generateTraceId` (defaults to `crypto.randomUUID()`).
+
+`requestId` is optional: it is included only when present in the store.
+
+The `ClientNats` connection is opened outside the request context, so connection-level logs (connect, disconnect, reconnect) never carry a stale traceId.
+
+In handlers, the values are available via `RequestContext.get()`, [`ctx.getTraceId()`/`ctx.getRequestId()`](#natscontext), and the [`@RequestId()`](#requestid) decorator.
+
+The storage is shared across the process via `Symbol.for()`, so even if `node_modules` contains two copies of the package, they use the same `AsyncLocalStorage` instance.
+
+```typescript
+import { randomUUID } from 'crypto';
+import { RequestContext, REQUEST_ID_HEADER } from 'nestjs-nats-transport';
+
+// Validate external request ID: safe characters, bounded length
+const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+function sanitizeRequestId(value: unknown): string | undefined {
+  return typeof value === 'string' && REQUEST_ID_RE.test(value) ? value : undefined;
+}
+
+// HTTP entry point: create the context in middleware
+function traceMiddleware(req, res, next) {
+  RequestContext.run(
+    {
+      traceId: randomUUID(),
+      requestId: sanitizeRequestId(req.headers[REQUEST_ID_HEADER]),
+    },
+    next,
+  );
+}
+
+// Logger: read the context
+const ctx = RequestContext.get();
+if (ctx) {
+  logEntry.traceId = ctx.traceId;
+  if (ctx.requestId) logEntry.requestId = ctx.requestId;
+}
+```
+
 ### Distributed Tracing
+
+For simple trace/request ID propagation without OpenTelemetry, see [Request Context](#request-context-traceid-and-requestid) above.
 
 OpenTelemetry integration:
 
@@ -2038,6 +2088,8 @@ interface NatsServerConnectionOptions {
   globalEventOptions?: Partial<NatsEventHandlerOptions>; // Global event settings
   serializer?: Serializer; // Custom serializer
   deserializer?: Deserializer; // Custom deserializer
+  requestContext?: boolean; // Restore RequestContext from incoming message headers
+  generateTraceId?: () => string; // Custom trace ID generator (default: crypto.randomUUID())
 }
 ```
 
@@ -2071,6 +2123,7 @@ interface NatsClientConnectionOptions {
   serializer?: Serializer; // Custom serializer
   deserializer?: Deserializer; // Custom deserializer
   requestTimeout?: number; // How long request() waits for a reply, in milliseconds (default 30000)
+  requestContext?: boolean; // Add traceId/requestId from RequestContext to outgoing headers
 }
 ```
 
@@ -2139,6 +2192,23 @@ async handleUserCreated(@Payload() data: { userId: string }, @Ctx() ctx: NatsCon
 }
 ```
 
+#### @RequestId
+
+Parameter decorator that extracts the request ID. Returns `string | undefined`.
+
+- **HTTP**: reads from `RequestContext.getRequestId()` (the context is created by the application's middleware)
+- **RPC / events**: reads from `NatsContext.getRequestId()`, which returns the value from `RequestContext` or from the `x-request-id` message header
+
+**Example:**
+
+```typescript
+@NatsMessagePattern('orders.create')
+async createOrder(@Payload() data: CreateOrderDto, @RequestId() requestId: string | undefined) {
+  this.logger.log(`Processing order, requestId=${requestId}`);
+  return this.ordersService.create(data);
+}
+```
+
 ---
 
 ### NatsEventHandlerOptions
@@ -2186,6 +2256,8 @@ Handler execution context.
 - `getMessage(): JsMsg | Msg` - Get native NATS message object
 - `getSubject(): string` - Get message subject
 - `getHeaders(): MsgHdrs | undefined` - Get message headers
+- `getTraceId(): string | undefined` - Effective trace ID: from `RequestContext` (restored or generated by `ServerNats`), otherwise from the message header
+- `getRequestId(): string | undefined` - Effective request ID: from `RequestContext`, otherwise from the message header
 
 **Example:**
 
@@ -2194,10 +2266,11 @@ Handler execution context.
 async getOrder(@Payload() data: any, @Ctx() ctx: NatsContext) {
   const message = ctx.getMessage();       // Native NATS message
   const subject = ctx.getSubject();        // 'order.get'
-  const headers = ctx.getHeaders()        // MsgHdrs object or undefined
-  const userId = headers?.get('user-id')   // 'user-123'
+  const headers = ctx.getHeaders();        // MsgHdrs object or undefined
+  const traceId = ctx.getTraceId();        // From RequestContext or header
+  const userId = headers?.get('user-id');   // 'user-123'
 
-  return { subject, userId };
+  return { subject, traceId, userId };
 }
 ```
 
@@ -2249,6 +2322,8 @@ throw new NatsRpcException({
 - `DEFAULT_NAK_DELAY` - 1000 (ms);
 - `DEFAULT_MAX_NAK_DELAY` - 60000 (ms);
 - `GRACE_PERIOD` - 10000 (ms): the longest `ServerNats.close()` waits for the handlers in progress
+- `TRACE_ID_HEADER` - `'x-trace-id'`: the header name used for trace ID propagation
+- `REQUEST_ID_HEADER` - `'x-request-id'`: the header name used for request ID propagation
 
 #### NakStrategy Enum
 
@@ -2280,6 +2355,28 @@ async processOrder(@Payload() data: OrderData) {
   // Success - automatic ack
 }
 ```
+
+---
+
+### RequestContext
+
+Async-local storage for cross-service request tracing.
+
+#### Type
+
+```typescript
+interface RequestContextStore {
+  traceId: string;
+  requestId?: string;
+}
+```
+
+#### Methods
+
+- `RequestContext.run<T>(store: RequestContextStore, fn: () => T): T` - Execute `fn` within the given context
+- `RequestContext.get(): RequestContextStore | undefined` - Get the current context, or `undefined` outside a `run()`
+- `RequestContext.getTraceId(): string | undefined` - Shorthand for `get()?.traceId`
+- `RequestContext.getRequestId(): string | undefined` - Shorthand for `get()?.requestId`
 
 ---
 

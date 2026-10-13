@@ -1,8 +1,12 @@
 import 'reflect-metadata';
-import { ErrorCode, JSONCodec, NatsError, connect } from 'nats';
+import { ErrorCode, JSONCodec, Match, MsgHdrs, NatsError, connect, headers as natsMsgHeaders } from 'nats';
+import { NatsRecordBuilder } from '@nestjs/microservices';
 import { QueuedIteratorImpl } from 'nats/lib/nats-base-client/queued_iterator';
 import { deferred } from 'nats/lib/nats-base-client/util';
+import { firstValueFrom, lastValueFrom } from 'rxjs';
 import { ClientNats } from './client-nats';
+import { RequestContext } from '../context';
+import { TRACE_ID_HEADER, REQUEST_ID_HEADER } from '../constants';
 
 // connect() is replaced to observe the connections the client opens
 jest.mock('nats', () => ({ ...jest.requireActual('nats'), connect: jest.fn() }));
@@ -174,5 +178,181 @@ describe('ClientNats connection', () => {
     await Promise.all([client.close(), client.close()]);
     expect(connection.drain).toHaveBeenCalledTimes(1);
     expect(client.logger.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('ClientNats request context', () => {
+  /** Captures headers sent by the nats.js request/publish calls */
+  const sentHeaders: MsgHdrs[] = [];
+  const reply = { data: JSONCodec().encode({ response: 'ok', isDisposed: true }) };
+  const natsRequest = jest.fn(async (_s: string, _d: any, opts: { headers: MsgHdrs }) => {
+    sentHeaders.push(opts.headers);
+    return reply;
+  });
+  const natsPublish = jest.fn((_s: string, _d: any, opts: { headers: MsgHdrs }) => {
+    sentHeaders.push(opts.headers);
+  });
+  const jsPublish = jest.fn(async (_s: string, _d: any, opts: { headers: MsgHdrs }) => {
+    sentHeaders.push(opts.headers);
+  });
+
+  const fakeConn = () =>
+    ({
+      isClosed: () => false,
+      closed: () => new Promise(() => undefined),
+      close: jest.fn(),
+      status: async function* () {},
+      getServer: () => 'nats://fake:4222',
+      info: { server_id: 'fake' },
+      request: natsRequest,
+      publish: natsPublish,
+      jetstream: () => ({ publish: jsPublish }),
+    }) as any;
+
+  const createCtxClient = (opts = {}): any => {
+    const client: any = new ClientNats({ connection: {}, requestContext: true, ...opts });
+    client.logger = { log: jest.fn(), error: jest.fn() };
+    return client;
+  };
+
+  beforeEach(() => {
+    sentHeaders.length = 0;
+    natsRequest.mockClear();
+    natsPublish.mockClear();
+    jsPublish.mockClear();
+    jest
+      .mocked(connect)
+      .mockReset()
+      .mockImplementation(async () => fakeConn());
+  });
+
+  it('UT-105 context headers on all four paths (request, event, send, emit)', async () => {
+    const store = { traceId: 'T', requestId: 'R' };
+
+    await RequestContext.run(store, async () => {
+      // request()
+      const client1 = createCtxClient();
+      await client1.request('orders', 1);
+
+      // event() with jetStream: true
+      const client2 = createCtxClient({ jetStream: true });
+      await client2.connect();
+      await client2.event('orders', 2);
+
+      // event() without jetStream
+      const client3 = createCtxClient({ jetStream: false });
+      await client3.connect();
+      await client3.event('orders', 3);
+
+      // send() (RPC via ClientProxy)
+      const client4 = createCtxClient();
+      await client4.connect();
+      await firstValueFrom(client4.send('orders', 4));
+
+      // emit()
+      const client5 = createCtxClient({ jetStream: true });
+      await client5.connect();
+      await lastValueFrom(client5.emit('orders', 5));
+    });
+
+    expect(sentHeaders.length).toBeGreaterThanOrEqual(5);
+    for (const hdrs of sentHeaders) {
+      expect(hdrs.get(TRACE_ID_HEADER)).toBe('T');
+      expect(hdrs.get(REQUEST_ID_HEADER)).toBe('R');
+    }
+  });
+
+  it('UT-106 explicit header in different case wins over context', async () => {
+    await RequestContext.run({ traceId: 'CTX', requestId: 'CTX-R' }, async () => {
+      const client = createCtxClient();
+      await client.request('orders', 1, { 'X-Trace-Id': 'mine', 'X-Request-Id': 'my-r' });
+
+      const hdrs = sentHeaders[0];
+      // Only the explicit values: the lowercase context headers are not added
+      expect(hdrs.values(TRACE_ID_HEADER)).toHaveLength(0);
+      expect(hdrs.get('X-Trace-Id')).toBe('mine');
+      expect(hdrs.values(REQUEST_ID_HEADER)).toHaveLength(0);
+      expect(hdrs.get('X-Request-Id')).toBe('my-r');
+    });
+  });
+
+  it('UT-107 NatsRecord of the caller is not mutated; different context per send', async () => {
+    const recordHdrs = natsMsgHeaders();
+    recordHdrs.set('user-id', 'U1');
+    const record = new NatsRecordBuilder().setData({ item: 1 }).setHeaders(recordHdrs).build();
+
+    await RequestContext.run({ traceId: 'T1' }, async () => {
+      const client = createCtxClient();
+      await client.request('orders', record);
+
+      expect(sentHeaders[0].get(TRACE_ID_HEADER)).toBe('T1');
+      expect(sentHeaders[0].get('user-id')).toBe('U1');
+      // Original record headers not mutated
+      expect(recordHdrs.has(TRACE_ID_HEADER)).toBe(false);
+    });
+
+    sentHeaders.length = 0;
+
+    await RequestContext.run({ traceId: 'T2' }, async () => {
+      const client = createCtxClient();
+      await client.request('orders', record);
+
+      expect(sentHeaders[0].get(TRACE_ID_HEADER)).toBe('T2');
+    });
+  });
+
+  it.each([
+    { name: 'requestContext: false', opts: { requestContext: false }, ctx: { traceId: 'T' }, requestId: undefined },
+    { name: 'no context', opts: {}, ctx: undefined, requestId: undefined },
+    { name: 'empty traceId', opts: {}, ctx: { requestId: 'R' } as any, requestId: 'R' },
+  ])('UT-108 no x-trace-id header when: $name', async ({ opts, ctx, requestId }) => {
+    const run = async () => {
+      const client = createCtxClient(opts);
+      await client.request('orders', 1);
+      const hdrs = sentHeaders[0];
+      expect(hdrs.has(TRACE_ID_HEADER)).toBe(false);
+      // nats.js returns '' for a missing header
+      expect(hdrs.get(REQUEST_ID_HEADER) || undefined).toBe(requestId);
+    };
+
+    if (ctx) {
+      await RequestContext.run(ctx, run);
+    } else {
+      await run();
+    }
+  });
+
+  it('UT-108 context without requestId — no x-request-id header', async () => {
+    await RequestContext.run({ traceId: 'T' }, async () => {
+      const client = createCtxClient();
+      await client.request('orders', 1);
+      expect(sentHeaders[0].get(TRACE_ID_HEADER)).toBe('T');
+      expect(sentHeaders[0].has(REQUEST_ID_HEADER)).toBe(false);
+    });
+  });
+
+  it('UT-109 connection opens outside request context', async () => {
+    const feed = new QueuedIteratorImpl<{ type: string; data?: unknown }>();
+    const conn = Object.assign(fakeConn(), { status: () => feed });
+    jest.mocked(connect).mockImplementation(async () => conn);
+
+    const client = createCtxClient();
+    const onDisconnect = jest.fn(() => RequestContext.get());
+
+    client.on('disconnect', onDisconnect);
+
+    await RequestContext.run({ traceId: 'A' }, async () => {
+      await client.request('orders', 1);
+    });
+
+    // The request was sent with traceId A
+    expect(sentHeaders[0].get(TRACE_ID_HEADER)).toBe('A');
+
+    // Status update outside context
+    feed.push({ type: 'disconnect', data: 'gone' });
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(onDisconnect).toHaveBeenCalled();
+    expect(onDisconnect.mock.results[0].value).toBeUndefined();
   });
 });

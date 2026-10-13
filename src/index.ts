@@ -1,4 +1,5 @@
 export * from './client';
+export * from './context';
 export * from './ctx-host';
 export * from './decorators';
 export * from './deserializers';

@@ -11,6 +11,7 @@ import {
   MsgHdrs,
   headers as natsMsgHeaders,
   MsgHdrsImpl,
+  Match,
 } from 'nats';
 import { NatsClientConnectionOptions } from '../interfaces';
 import { NatsRequestSerializer } from '../serializers';
@@ -19,6 +20,9 @@ import { Observable, ReplaySubject, distinctUntilChanged, firstValueFrom } from 
 import { EventEmitter } from 'events';
 import { NatsRpcException } from '../exceptions/rpc-exception';
 import { addStatusListener, closeConnection, watchStatus } from '../connection/nats-connection';
+import { RequestContext } from '../context';
+import { runOutsideRequestContext } from '../context/request-context';
+import { TRACE_ID_HEADER, REQUEST_ID_HEADER } from '../constants';
 
 /**
  * @publicApi
@@ -67,7 +71,9 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
     if (this.natsClient && !this.natsClient.isClosed()) {
       return this.natsClient;
     }
-    this.connectionPromise ??= this.openConnection().finally(() => (this.connectionPromise = undefined));
+    this.connectionPromise ??= runOutsideRequestContext(() => this.openConnection()).finally(
+      () => (this.connectionPromise = undefined),
+    );
     return this.connectionPromise;
   }
 
@@ -141,7 +147,7 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
 
       const channel = this.normalizePattern(packet.pattern);
       const serializedPacket: NatsRecord<any, MsgHdrs> = this.serializer.serialize(packet);
-      const headers = serializedPacket.headers || natsMsgHeaders();
+      const headers = this.withContextHeaders(serializedPacket.headers || natsMsgHeaders());
 
       this.natsClient
         .request(channel, serializedPacket.data, {
@@ -173,7 +179,7 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
 
     const pattern = this.normalizePattern(packet.pattern);
     const serializedPacket: NatsRecord = this.serializer.serialize(packet);
-    const headers = serializedPacket.headers || natsMsgHeaders();
+    const headers = this.withContextHeaders(serializedPacket.headers || natsMsgHeaders());
 
     return new Promise<void>(async (resolve, reject) => {
       try {
@@ -221,6 +227,27 @@ export class ClientNats extends ClientProxy implements OnModuleDestroy {
 
   protected initializeDeserializer(options: NatsClientConnectionOptions) {
     this.deserializer = options?.deserializer ?? new NatsResponseJSONDeserializer();
+  }
+
+  /** Copies headers and adds context fields when `requestContext` is enabled. Explicit headers win. */
+  private withContextHeaders(headers: MsgHdrs): MsgHdrs {
+    if (!this.options.requestContext) return headers;
+    const ctx = RequestContext.get();
+    if (!ctx) return headers;
+
+    const copy = natsMsgHeaders();
+    for (const key of headers.keys()) {
+      for (const value of headers.values(key)) {
+        copy.append(key, value);
+      }
+    }
+    if (ctx.traceId && !copy.has(TRACE_ID_HEADER, Match.IgnoreCase)) {
+      copy.set(TRACE_ID_HEADER, ctx.traceId);
+    }
+    if (ctx.requestId && !copy.has(REQUEST_ID_HEADER, Match.IgnoreCase)) {
+      copy.set(REQUEST_ID_HEADER, ctx.requestId);
+    }
+    return copy;
   }
 
   private prepareRecord(data: any, headers?: Record<string, any>) {

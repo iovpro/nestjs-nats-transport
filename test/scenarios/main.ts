@@ -7,6 +7,7 @@ import { scenarios as jetstream } from './jetstream.scenarios';
 import { scenarios as logging } from './logging.scenarios';
 import { scenarios as hooks } from './hooks.scenarios';
 import { scenarios as rpc } from './rpc.scenarios';
+import { scenarios as context } from './context.scenarios';
 
 const registry: Record<string, () => Promise<void>> = {
   ...rpc,
@@ -15,6 +16,7 @@ const registry: Record<string, () => Promise<void>> = {
   ...connection,
   ...logging,
   ...hooks,
+  ...context,
 };
 
 process.on('exit', code => console.log(`@@EXIT ${code}`));

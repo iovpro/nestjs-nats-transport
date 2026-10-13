@@ -32,9 +32,10 @@ import {
   NatsError,
   ConsumerMessages,
   Subscription,
+  Match,
 } from 'nats';
 import { SimpleMutex } from 'nats/lib/nats-base-client/util';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { STATUS_CODES } from 'http';
 import { Observable, ReplaySubject, distinctUntilChanged, finalize } from 'rxjs';
@@ -56,7 +57,10 @@ import {
   NATS_AUTHORIZATION_VIOLATION_ERROR_CODE,
   RECONNECT_DELAY,
   GRACE_PERIOD,
+  TRACE_ID_HEADER,
+  REQUEST_ID_HEADER,
 } from '../constants';
+import { RequestContext } from '../context';
 
 type ProcessingStartHook = (transportId: Transport | symbol, context: BaseRpcContext, done: () => Promise<any>) => void;
 type ProcessingEndHook = (transportId: Transport | symbol, context: BaseRpcContext) => void;
@@ -455,7 +459,11 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       for await (const message of iter) {
         await mutex.lock();
         if (session.closing) return;
-        void this.track(this.handleNatsJetStreamEvent(channel, message, handler, mutex, eventOptions));
+        void this.track(
+          this.withRequestContext(message, () =>
+            this.handleNatsJetStreamEvent(channel, message, handler, mutex, eventOptions),
+          ),
+        );
       }
     } catch (err) {
       if (err instanceof NatsError && err.code === NATS_CONNECTION_DRAINING_ERROR_CODE) {
@@ -478,7 +486,7 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       if (error) {
         return this.logger.error(error.message, error.stack);
       }
-      return this.track(this.handleNatsEvent(channel, message, handler));
+      return this.track(this.withRequestContext(message, () => this.handleNatsEvent(channel, message, handler)));
     };
   }
 
@@ -489,10 +497,12 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
       }
       // Only a request that cannot be deserialized gets here: sendWithHooks() replies to the other failures
       return this.track(
-        this.handleNatsRequest(channel, message, handler).catch(err => {
-          this.logger.error(`Failed to process request [${channel}]`, err?.stack);
-          return this.respondWithError(message, errorReply(HttpStatus.BAD_REQUEST, err));
-        }),
+        this.withRequestContext(message, () =>
+          this.handleNatsRequest(channel, message, handler).catch(err => {
+            this.logger.error(`Failed to process request [${channel}]`, err?.stack);
+            return this.respondWithError(message, errorReply(HttpStatus.BAD_REQUEST, err));
+          }),
+        ),
       );
     };
   }
@@ -502,6 +512,22 @@ export class ServerNats extends Server implements CustomTransportStrategy, OnMod
     const tracked: Promise<unknown> = work.catch(() => undefined).then(() => this.processing.delete(tracked));
     this.processing.add(tracked);
     return work;
+  }
+
+  /** Wraps `fn` in RequestContext.run() when the option is enabled, extracting trace from message headers */
+  private withRequestContext<T>(msg: Msg | JsMsg, fn: () => T): T {
+    if (!this.options.requestContext) return fn();
+    let hdrs: MsgHdrs | undefined;
+    try {
+      hdrs = msg.headers;
+    } catch {
+      // nats.js throws on headers it cannot decode: the handler reads them again and fails the message as before
+    }
+    const store = {
+      traceId: hdrs?.get(TRACE_ID_HEADER, Match.IgnoreCase) || (this.options.generateTraceId ?? randomUUID)(),
+      requestId: hdrs?.get(REQUEST_ID_HEADER, Match.IgnoreCase) || undefined,
+    };
+    return RequestContext.run(store, fn);
   }
 
   /** Runs the handler and subscribes to its result inside the processing hooks, as the base Server of NestJS 12 */

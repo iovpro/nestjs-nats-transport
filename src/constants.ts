@@ -1,6 +1,9 @@
 export const NAK = Symbol('nats:nak');
 export const TERM = Symbol('nats:term');
 
+export const TRACE_ID_HEADER = 'x-trace-id';
+export const REQUEST_ID_HEADER = 'x-request-id';
+
 export const DEFAULT_NAK_DELAY = 1000;
 export const DEFAULT_MAX_NAK_DELAY = 60000;
 

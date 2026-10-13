@@ -147,6 +147,23 @@ The users of the server with authentication are defined in `test/nats-auth.conf`
 | UT-99     | `ClientNats.close()` called again while it runs waits for the same close          |
 | UT-100    | A permissions violation is logged with the operation and the subject              |
 | UT-101    | A failed drain is logged and the connection is closed anyway                      |
+| UT-102    | `RequestContext` run/get stores and restores context across await and nesting     |
+| UT-103    | A second copy of the module sees the same `AsyncLocalStorage` via `Symbol.for`    |
+| UT-104    | `runOutsideRequestContext` exits context and restores it after                    |
+| UT-105    | Context headers on all four client paths: `request`, `event`, `send`, `emit`      |
+| UT-106    | Explicit `X-Trace-Id`/`X-Request-Id` in another case win over the context         |
+| UT-107    | `NatsRecord` of the caller is not mutated; different context per send             |
+| UT-108    | No `x-trace-id` without the option, a context or a traceId; `x-request-id` if set |
+| UT-109    | Connection opens outside request context                                          |
+| UT-110    | Handler sees context from headers (case-insensitive) on all three server paths    |
+| UT-111    | traceId generated when header missing: custom and default                         |
+| UT-112    | No context when `requestContext` option is off                                    |
+| UT-113    | Error log for bad JSON is inside context on all three paths                       |
+| UT-114    | Processing hooks see context                                                      |
+| UT-115    | Concurrent JetStream messages do not mix contexts                                 |
+| UT-116    | `NatsContext.getTraceId()`/`getRequestId()`: context, header, empty, missing      |
+| UT-117    | `@RequestId()`: RPC with header, RPC without, HTTP with context, HTTP without     |
+| UT-118    | Malformed headers fail the message as without the option on all three paths       |
 | RPC-01    | A non-JSON request does not crash the service                                     |
 | RPC-02    | An empty request does not crash the service                                       |
 | RPC-03    | A response larger than `max_payload` does not crash the service                   |
@@ -185,6 +202,8 @@ The users of the server with authentication are defined in `test/nats-auth.conf`
 | CON-12    | A deleted consumer causes retries, not a pull storm                               |
 | CON-13    | `close()` closes the connection at once while NATS is down                        |
 | HOOK-01   | Handlers run inside the processing hooks: RPC, events, JetStream                  |
+| CTX-01    | traceId/requestId reach RPC (and a downstream RPC), NATS and JetStream handlers   |
+| CTX-02    | Messages without headers get generated traceId and undefined requestId            |
 | LOG-01    | The standard Nest logger prints the stack of a handler error                      |
 | LOG-02    | The standard Nest logger prints the stack of an internal library error            |
 | DOC-01    | The README code examples compile                                                  |
@@ -557,6 +576,76 @@ Expected: `NatsError: type: "error", data: "PERMISSIONS_VIOLATION", permissionCo
 Steps: `drain()` rejects with `CONNECTION_DRAINING`.
 Expected: the error `Failed to drain the NATS server due to an error, forcibly closing the connection: reason=CONNECTION_DRAINING` is logged and the connection is closed.
 
+UT-102…UT-118 check the request context: `RequestContext` (`src/context/request-context.spec.ts`), the headers of `ClientNats` (`src/client/client-nats.spec.ts`), the context of `ServerNats` (`src/server/server-nats.spec.ts`), `NatsContext` (`src/ctx-host/nats.context.spec.ts`) and `@RequestId()` (`src/decorators/request-id.decorator.spec.ts`).
+
+**UT-102 — run/get**
+Steps: `RequestContext.run()` with values, check `get()`/`getTraceId()`/`getRequestId()` before, inside, after `await`, inside nested `run()`, after return.
+Expected: values available inside `run`, `undefined` outside, inner `run` does not leak into outer.
+
+**UT-103 — shared storage**
+Steps: load a second copy of the module via `jest.isolateModules()`; `run()` from one copy, `get()` from the other.
+Expected: both copies share the same `AsyncLocalStorage` via `Symbol.for`.
+
+**UT-104 — runOutsideRequestContext**
+Steps: inside `run({ traceId: 'A' })` call `runOutsideRequestContext()`; inside it check `get()` before and after `await`.
+Expected: `get()` is `undefined` inside the exit; `'A'` is restored after.
+
+**UT-105 — context headers on all four client paths**
+Steps: `request()`, `event()`, `send()`, `emit()` inside `RequestContext.run()` with `requestContext: true`.
+Expected: every outgoing message has `x-trace-id` and `x-request-id`.
+
+**UT-106 — explicit header wins (case-insensitive)**
+Steps: `request('orders', 1, { 'X-Trace-Id': 'mine', 'X-Request-Id': 'my-r' })` inside a context with other values.
+Expected: the message has only the explicit `X-Trace-Id: mine` and `X-Request-Id: my-r`; the lowercase context headers are not added.
+
+**UT-107 — NatsRecord not mutated; different context per send**
+Steps: send the same `NatsRecord` twice in contexts `T1` and `T2`.
+Expected: each message carries its own traceId; the record's original headers are unmodified.
+
+**UT-108 — context headers that are not sent**
+Steps: `requestContext: false` with a context; `requestContext: true` without a context; a context without `traceId` but with `requestId: 'R'`; a context without `requestId`.
+Expected: no `x-trace-id` in the first three; the request succeeds; `x-request-id: R` is sent only in the third; no `x-request-id` in the last.
+
+**UT-109 — connection outside context**
+Steps: first `request()` inside context `A` opens the connection; a `disconnect` status event fires after.
+Expected: the request has `x-trace-id: A`; the `on('disconnect')` listener sees `RequestContext.get() === undefined`.
+
+**UT-110 — handler sees context (server, all three paths)**
+Steps: `getEventHandler`, `getRequestHandler`, `runSubscription` with messages carrying `X-Trace-Id` and `X-Request-Id`.
+Expected: the handler (async, with `await`) reads the correct `RequestContext.get()`.
+
+**UT-111 — traceId generated when header missing**
+Steps: message without `x-trace-id`; with and without custom `generateTraceId`.
+Expected: handler sees the generated value; `requestId` is `undefined`.
+
+**UT-112 — no context when option is off**
+Steps: `requestContext` not set; message with headers.
+Expected: `RequestContext.get()` is `undefined` inside the handler.
+
+**UT-113 — error log inside context**
+Steps: message with bad JSON and `x-trace-id: T`; all three paths.
+Expected: `RequestContext.getTraceId()` is `'T'` when `logger.error` is called.
+
+**UT-114 — processing hooks see context**
+Steps: `setOnProcessingStartHook`; core event with `x-trace-id: HOOK-T`.
+Expected: `RequestContext.getTraceId()` is `'HOOK-T'` inside the hook.
+
+**UT-115 — concurrent messages**
+Steps: two JetStream messages with `T1` and `T2`, `max_handlers: 2`, handlers with `await`.
+Expected: after `await` each handler still sees its own traceId.
+
+**UT-116 — NatsContext.getTraceId()/getRequestId()**
+Steps: four cases: context + header, header only (different case), headers exist but field missing, no headers.
+Expected: context wins over header; empty string → `undefined`; no headers → `undefined`.
+
+**UT-117 — @RequestId()**
+Steps: RPC with NatsContext + header; RPC without `getRequestId`; HTTP inside context; HTTP outside context.
+Expected: RPC returns header value or `undefined`; HTTP returns context value or `undefined`.
+
+**UT-118 — malformed headers (server, all three paths)**
+Steps: `requestContext: true` with `generateTraceId: () => 'GEN'`; a message whose headers nats.js cannot decode (a key with a space) through `getEventHandler`, `getRequestHandler`, `runSubscription`.
+Expected: the handler is not called and the message fails as without the option: `Incorrect event data` for a core event, `Failed to process request [orders]` and a 400 reply for RPC, `Failed to process event data` and `term` for JetStream. The error is logged inside the generated context `GEN`; no unhandled rejection, no consumer restart.
+
 ### RPC (`test/e2e/rpc.e2e-spec.ts`, `test/scenarios/rpc.scenarios.ts`)
 
 **RPC-01 — non-JSON request** (`rpc-01-malformed-payload`)
@@ -715,6 +804,16 @@ Expected: the connection is closed (otherwise nats.js reconnects forever and kee
 **HOOK-01 — handlers inside the processing hooks** (`hook-01-processing-hooks`)
 Steps: two services — core NATS (an RPC handler and an event handler) and JetStream (an event handler); the start hook opens an `AsyncLocalStorage` context with the message subject, the end hook records the call; the handlers are async (20 ms) and record the context they see.
 Expected: for each subject — `start 2`, `handler in <subject>`, `end 2`; the RPC reply is the subject from the hook context.
+
+### Request context (`test/e2e/context.e2e-spec.ts`, `test/scenarios/context.scenarios.ts`)
+
+**CTX-01 — cross-service propagation** (`ctx-01-cross-service-propagation`)
+Steps: `ClientNats` with `requestContext: true` sends an RPC request, a NATS event and a JetStream event inside `RequestContext.run({ traceId: 'trace-1', requestId: 'req-1' })`. The RPC handler sends a downstream RPC.
+Expected: all handlers (RPC, downstream RPC, NATS event, JetStream event) see `trace-1` and `req-1` via `RequestContext`, `ctx.getTraceId()`, `ctx.getRequestId()`, and `@RequestId()`.
+
+**CTX-02 — message without headers** (`ctx-02-message-without-headers`)
+Steps: raw nats.js connection sends RPC and JetStream event without headers. Server uses custom `generateTraceId`.
+Expected: handlers see generated traceId via `RequestContext` and `ctx.getTraceId()`; `requestId` is `undefined` everywhere.
 
 ### Logging (`test/e2e/logging.e2e-spec.ts`)
 

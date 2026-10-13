@@ -13,4 +13,8 @@ export interface NatsServerConnectionOptions {
   jetStream?: boolean;
   jetStreamOptions?: JetStreamOptions;
   globalEventOptions?: Partial<NatsEventHandlerOptions>;
+  /** Enable RequestContext restoration from incoming message headers */
+  requestContext?: boolean;
+  /** Custom trace ID generator; defaults to `crypto.randomUUID()` */
+  generateTraceId?: () => string;
 }

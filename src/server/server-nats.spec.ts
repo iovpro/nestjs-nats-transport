@@ -1,9 +1,19 @@
 import { AsyncLocalStorage } from 'async_hooks';
-import { DeliverPolicy, ErrorCode, JSONCodec, JsMsg, NatsError, connect } from 'nats';
+import {
+  DeliverPolicy,
+  ErrorCode,
+  JSONCodec,
+  JsMsg,
+  MsgHdrsImpl,
+  NatsError,
+  connect,
+  headers as natsHeaders,
+} from 'nats';
 import { QueuedIteratorImpl } from 'nats/lib/nats-base-client/queued_iterator';
 import { SimpleMutex, deferred } from 'nats/lib/nats-base-client/util';
 import { defer } from 'rxjs';
 import { CONSUMER_RETRY_DELAY, GRACE_PERIOD, NAK, RECONNECT_DELAY } from '../constants';
+import { RequestContext } from '../context';
 import { NatsContext } from '../ctx-host/nats.context';
 import { NakStrategy, NatsEventHandlerOptions } from '../interfaces';
 import { ServerNats } from './server-nats';
@@ -1345,5 +1355,194 @@ describe('ServerNats internals', () => {
 
   it('UT-74 propagatesEventHandlerErrors should be true, as NestJS 12 expects of a transport that reports handler errors', () => {
     expect(createServer().propagatesEventHandlerErrors).toBe(true);
+  });
+
+  describe('request context', () => {
+    const msgWith = (traceId?: string, requestId?: string) => {
+      const hdrs = natsHeaders();
+      if (traceId) hdrs.set('X-Trace-Id', traceId);
+      if (requestId) hdrs.set('X-Request-Id', requestId);
+      return {
+        subject: 'orders',
+        data: JSONCodec().encode({ pattern: 'orders', data: { id: 1 } }),
+        headers: hdrs,
+        reply: 'reply-to',
+        respond: jest.fn(),
+        info: { deliveryCount: 1 },
+        working: jest.fn(),
+        ack: jest.fn(),
+        nak: jest.fn(),
+        term: jest.fn(),
+      };
+    };
+
+    const ctxServer = (opts = {}) => createServer(undefined, { requestContext: true, ...opts });
+
+    const paths: Record<string, (server: any, msg: any, handler: any) => Promise<any>> = {
+      'core event': (server, msg, handler) => server.getEventHandler('orders', handler)(undefined, msg),
+      RPC: (server, msg, handler) => server.getRequestHandler('orders', handler)(undefined, msg),
+      JetStream: async (server, msg, handler) => {
+        const messages = new QueuedIteratorImpl();
+        messages.push(msg);
+        messages.stop();
+        await server.runSubscription({ consume: async () => messages }, 'orders', handler, { max_handlers: 1 });
+      },
+    };
+
+    it.each(Object.keys(paths))('UT-110 handler sees context from headers (case-insensitive) on %s', async path => {
+      const server = ctxServer();
+      const msg = msgWith('T-110', 'R-110');
+      let captured: any;
+      const handler = Object.assign(
+        async () => {
+          await new Promise(r => setImmediate(r));
+          captured = RequestContext.get();
+        },
+        { extras: {} },
+      );
+
+      await paths[path](server, msg, handler);
+      await settle();
+
+      expect(captured).toEqual({ traceId: 'T-110', requestId: 'R-110' });
+    });
+
+    it.each([
+      { name: 'with generateTraceId', opts: { generateTraceId: () => 'GEN' }, expected: 'GEN' },
+      { name: 'default (randomUUID)', opts: {}, expected: expect.stringMatching(/^[0-9a-f-]{36}$/) },
+    ])('UT-111 traceId generated when header missing: $name', async ({ opts, expected }) => {
+      const server = ctxServer(opts);
+      const msg = msgWith(undefined, undefined);
+      let captured: any;
+      const handler = Object.assign(
+        async () => {
+          captured = RequestContext.get();
+        },
+        { extras: {} },
+      );
+
+      await paths['RPC'](server, msg, handler);
+      await settle();
+
+      expect(captured.traceId).toEqual(expected);
+      expect(captured.requestId).toBeUndefined();
+    });
+
+    it('UT-112 no context when option is off', async () => {
+      const server = createServer();
+      const msg = msgWith('T', 'R');
+      let captured: any = 'not-called';
+      const handler = Object.assign(
+        async () => {
+          captured = RequestContext.get();
+        },
+        { extras: {} },
+      );
+
+      await paths['RPC'](server, msg, handler);
+      await settle();
+
+      expect(captured).toBeUndefined();
+    });
+
+    it.each(Object.keys(paths))('UT-113 error log for bad JSON is inside context on %s', async path => {
+      const server = ctxServer();
+      const capturedTraceIds: (string | undefined)[] = [];
+      server.logger.error = jest.fn((..._args: any[]) => {
+        capturedTraceIds.push(RequestContext.getTraceId());
+      });
+
+      const badMsg = {
+        ...msgWith('ERR-T'),
+        data: Buffer.from('not-json'),
+      };
+
+      await paths[path](
+        server,
+        badMsg,
+        Object.assign(async () => {}, { extras: {} }),
+      );
+      await settle();
+
+      expect(capturedTraceIds.length).toBeGreaterThanOrEqual(1);
+      capturedTraceIds.forEach(t => expect(t).toBe('ERR-T'));
+    });
+
+    it('UT-114 processing hooks see context', async () => {
+      const server = ctxServer();
+      let hookTraceId: string | undefined;
+      server.setOnProcessingStartHook((_t: any, _c: any, done: any) => {
+        hookTraceId = RequestContext.getTraceId();
+        return done();
+      });
+
+      const msg = msgWith('HOOK-T');
+      const handler = Object.assign(async () => {}, { extras: {} });
+      await paths['core event'](server, msg, handler);
+      await settle();
+
+      expect(hookTraceId).toBe('HOOK-T');
+    });
+
+    it('UT-115 concurrent messages do not mix contexts', async () => {
+      const server = ctxServer();
+      const results: string[] = [];
+      const handler = Object.assign(
+        async () => {
+          const before = RequestContext.getTraceId();
+          await new Promise(r => setTimeout(r, 50));
+          const after = RequestContext.getTraceId();
+          results.push(`${before}:${after}`);
+        },
+        { extras: { max_handlers: 2 } },
+      );
+
+      const msg1 = msgWith('T1');
+      const msg2 = msgWith('T2');
+
+      const messages = new QueuedIteratorImpl();
+      messages.push(msg1);
+      messages.push(msg2);
+      messages.stop();
+
+      await server.runSubscription({ consume: async () => messages }, 'orders', handler, { max_handlers: 2 });
+      await settle();
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(results).toContain('T1:T1');
+      expect(results).toContain('T2:T2');
+    });
+
+    it.each([
+      { path: 'core event', log: 'Incorrect event data', outcome: { reply: undefined, terms: 0 } },
+      {
+        path: 'RPC',
+        log: 'Failed to process request [orders]',
+        outcome: {
+          reply: { err: { message: expect.stringMatching(/^Bad Request: /), statusCode: 400 }, isDisposed: true },
+          terms: 0,
+        },
+      },
+      { path: 'JetStream', log: 'Failed to process event data', outcome: { reply: undefined, terms: 1 } },
+    ])(
+      'UT-118 a message with malformed headers should fail on $path as without the option',
+      async ({ path, log, outcome }) => {
+        const server = ctxServer({ generateTraceId: () => 'GEN' });
+        const errors: unknown[] = [];
+        server.logger.error = jest.fn((message: string) => errors.push([message, RequestContext.getTraceId()]));
+        // nats.js decodes the headers when they are first read, and a key with a space throws BAD_HEADER
+        const raw = Buffer.from('NATS/1.0\r\nbad key: 1\r\n\r\n');
+        const msg = Object.defineProperty(msgWith(), 'headers', { get: () => MsgHdrsImpl.decode(raw) });
+        const handler = Object.assign(jest.fn(), { extras: {} });
+
+        await paths[path](server, msg, handler);
+        await settle();
+        const reply = msg.respond.mock.calls[0]?.[0];
+
+        expect(handler).not.toHaveBeenCalled();
+        expect(errors).toEqual([[log, 'GEN']]);
+        expect({ reply: reply && JSONCodec().decode(reply), terms: msg.term.mock.calls.length }).toEqual(outcome);
+      },
+    );
   });
 });
